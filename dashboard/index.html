@@ -1,0 +1,1299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>PolyLock ~ BTC 5m LOCK Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  /* ── CATPPUCCIN MOCHA — peach/orange accent ── */
+  :root {
+    --bg-deep:    #1e1e2e;
+    --bg-pane:    rgba(17, 17, 27, 0.85);
+    --bg-header:  #181825;
+    --border:     rgba(250, 179, 135, 0.14);
+    --border-hot: rgba(250, 179, 135, 0.50);
+
+    --text:       #cdd6f4;
+    --text-dim:   #bac2de;
+    --text-mute:  #6c7086;
+
+    --pink:       #f5c2e7;
+    --pink-soft:  #f2cdcd;
+    --purple:     #cba6f7;
+    --purple-bright: #b4befe;
+    --cyan:       #89dceb;
+    --green:      #a6e3a1;
+    --red:        #f38ba8;
+    --yellow:     #f9e2af;
+    --orange:     #fab387;
+    --orange-bright: #fab387;
+    --teal:       #94e2d5;
+    --blue:       #89b4fa;
+    --mauve:      #cba6f7;
+
+    --btc:        #fab387;
+    --btc-dim:    rgba(250, 179, 135, 0.20);
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+
+  body {
+    font-family: 'Fira Code', ui-monospace, monospace;
+    font-size: 13px;
+    color: var(--text);
+    background: var(--bg-deep);
+    overflow-x: hidden;
+    line-height: 1.5;
+  }
+
+  body::before {
+    content: '';
+    position: fixed; inset: 0;
+    background:
+      radial-gradient(ellipse 75% 55% at 10% 15%, rgba(250,179,135,.12), transparent 65%),
+      radial-gradient(ellipse 60% 45% at 90% 20%, rgba(249,226,175,.09), transparent 65%),
+      radial-gradient(ellipse 55% 45% at 50% 90%, rgba(203,166,247,.07), transparent 65%),
+      linear-gradient(180deg, #1a1826 0%, #1e1e2e 50%, #181825 100%);
+    z-index: -2;
+  }
+
+  body::after {
+    content: '';
+    position: fixed; inset: 0;
+    background:
+      repeating-linear-gradient(0deg, rgba(255,255,255,.007) 0 1px, transparent 1px 3px),
+      radial-gradient(circle at 1px 1px, rgba(250,179,135,.025) 1px, transparent 0);
+    background-size: auto, 28px 28px;
+    pointer-events: none;
+    z-index: -1;
+  }
+
+  /* ── AURORA KEYFRAMES ── */
+  @keyframes aurora { 0%{background-position:0% 200%} 50%{background-position:200% 0%} 100%{background-position:400% 200%} }
+  @keyframes aurora_stripe { 0%{background-position:0% 200%} 100%{background-position:200% 200%} }
+
+  /* ── TOPBAR — floating pill style ── */
+  .topbar {
+    position: sticky; top: 0; z-index: 100;
+    display: flex; align-items: center;
+    padding: 8px 16px;
+    background: transparent;
+    font-size: 12px; gap: 12px;
+  }
+  .workspaces {
+    display: flex; gap: 5px; align-items: center;
+    background: #11111b; border-radius: 15px;
+    padding: 4px 10px;
+    box-shadow: rgba(0,0,0,.3) 0 2px 8px;
+  }
+  .ws-sep { color: var(--text-mute); font-size: 9px; margin: 0 1px; }
+  .ws {
+    width: 26px; height: 22px;
+    display: grid; place-items: center;
+    border-radius: 10px; background: #11111b;
+    color: #b4befe; font-weight: 700; font-size: 11px;
+    text-decoration: none;
+    transition: all .3s cubic-bezier(.55,-.68,.48,1.682);
+    cursor: pointer;
+  }
+  .ws:hover { background: #313244; transform: scale(1.1); }
+  .ws-home {
+    background: var(--btc); color: #11111b; font-size: 13px;
+    box-shadow: 0 0 10px rgba(250,179,135,.45);
+  }
+  .ws-home:hover { transform: scale(1.15); box-shadow: 0 0 16px rgba(250,179,135,.7); }
+  .ws.active {
+    padding: 0 10px;
+    background: radial-gradient(circle,
+      rgba(203,166,247,1) 0%, rgba(249,226,175,1) 19%,
+      rgba(198,255,194,1) 36%, rgba(255,255,255,1) 52%,
+      rgba(148,226,213,1) 66%, rgba(180,190,254,1) 83%,
+      rgba(137,180,250,1) 100%
+    );
+    background-size: 400% 400%;
+    animation: aurora 20s ease-in-out infinite;
+    color: #11111b; box-shadow: rgba(0,0,0,.3) 0 2px 8px;
+  }
+  .topbar-title { flex: 1; display: flex; justify-content: center; }
+  .topbar-title-inner {
+    background: #11111b; border-radius: 15px;
+    padding: 5px 22px; font-size: 11px;
+    letter-spacing: 2px; text-transform: uppercase;
+    color: var(--text-dim);
+    box-shadow: rgba(0,0,0,.25) 0 2px 8px;
+  }
+  .topbar-right { display: flex; gap: 8px; align-items: center; font-size: 11px; }
+  .tr-pill {
+    display: flex; align-items: center; gap: 8px;
+    background: #11111b; border-radius: 15px;
+    padding: 4px 14px; color: var(--text-dim);
+    box-shadow: rgba(0,0,0,.25) 0 2px 8px;
+  }
+  .tr-pill .hot { color: var(--btc); font-weight: 600; }
+  .clock-pill {
+    background: linear-gradient(118deg,
+      rgba(205,214,244,1) 5%, rgba(243,139,168,1) 5%, rgba(243,139,168,1) 20%,
+      rgba(205,214,244,1) 20%, rgba(205,214,244,1) 40%, rgba(243,139,168,1) 40%,
+      rgba(243,139,168,1) 60%, rgba(205,214,244,1) 60%, rgba(205,214,244,1) 80%,
+      rgba(243,139,168,1) 80%, rgba(243,139,168,1) 95%, rgba(205,214,244,1) 95%
+    );
+    background-size: 200% 300%; animation: aurora_stripe 4s linear infinite;
+    border-radius: 15px; padding: 5px 16px;
+    font-size: 13px; font-weight: 700;
+    color: #11111b; text-shadow: 0 0 4px rgba(0,0,0,.3);
+    box-shadow: rgba(0,0,0,.25) 0 2px 8px;
+  }
+  .topbar-right .live-dot {
+    display: inline-block; width: 6px; height: 6px;
+    background: var(--green); border-radius: 50%;
+    animation: pulse_dot 1.6s ease-in-out infinite;
+    vertical-align: middle; margin-right: 3px;
+  }
+  @keyframes pulse_dot { 0%,100%{opacity:1} 50%{opacity:.4} }
+
+  /* ───────────────────────────────────────────────
+     LAYOUT — Tiling 3-col × 2-row
+     ─────────────────────────────────────────────── */
+  .desktop {
+    display: grid;
+    grid-template-columns: 1.1fr 1.25fr 1.05fr;
+    grid-template-rows: auto auto;
+    gap: 13px;
+    padding: 13px;
+    min-height: calc(100vh - 80px);
+  }
+  .pane-stats   { grid-column: 1; grid-row: 1; }
+  .pane-hero    { grid-column: 2; grid-row: 1; }
+  .pane-window  { grid-column: 3; grid-row: 1; }
+  .pane-history { grid-column: 3; grid-row: 2; }
+  .pane-logs    { grid-column: 1; grid-row: 2; }
+  .pane-signal  { grid-column: 2; grid-row: 2; }
+
+  /* ───────────────────────────────────────────────
+     PANE
+     ─────────────────────────────────────────────── */
+  .pane {
+    background: var(--bg-pane);
+    backdrop-filter: blur(24px);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+    display: flex; flex-direction: column;
+    position: relative;
+    box-shadow: 0 8px 32px rgba(0,0,0,.48), inset 0 1px 0 rgba(250,179,135,.05);
+    transition: border-color .2s, box-shadow .2s;
+  }
+  .pane:hover {
+    border-color: rgba(250,179,135,.25);
+    box-shadow: 0 12px 40px rgba(0,0,0,.55), 0 0 24px rgba(250,179,135,.08), inset 0 1px 0 rgba(250,179,135,.08);
+  }
+  .pane.pane-alert {
+    border-color: rgba(255, 85, 85, .5) !important;
+    box-shadow: 0 0 32px rgba(255,85,85,.18), 0 8px 32px rgba(0,0,0,.5) !important;
+    animation: alert-glow 1s ease-in-out infinite alternate;
+  }
+  @keyframes alert-glow {
+    from { box-shadow: 0 0 20px rgba(255,85,85,.15), 0 8px 32px rgba(0,0,0,.5); }
+    to   { box-shadow: 0 0 40px rgba(255,85,85,.35), 0 8px 32px rgba(0,0,0,.5); }
+  }
+
+  .pane-header {
+    display: flex; align-items: center; gap: 6px;
+    padding: 8px 12px 6px;
+    background: var(--bg-header);
+    border-bottom: 1px solid var(--border);
+    font-size: 11.5px;
+    color: var(--text-dim);
+    letter-spacing: .3px;
+    flex-shrink: 0;
+  }
+  .pane-header .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; }
+  .pane-header .dot.r { background: #f38ba8; }
+  .pane-header .dot.y { background: #f9e2af; }
+  .pane-header .dot.g { background: #a6e3a1; }
+  .pane-header .prompt { color: var(--btc); margin-left: 8px; }
+  .pane-header .user   { color: var(--teal); }
+  .pane-header .at     { color: var(--text-mute); }
+  .pane-header .host   { color: var(--blue); }
+  .pane-header .cmd    { color: var(--text); margin-left: 6px; }
+
+  .pane-body { flex: 1; padding: 12px 14px; overflow: auto; }
+
+  ::-webkit-scrollbar { width: 5px; height: 5px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: rgba(250,179,135,.22); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: rgba(250,179,135,.4); }
+
+  /* ───────────────────────────────────────────────
+     STATS PANE
+     ─────────────────────────────────────────────── */
+  .stats-title {
+    color: var(--btc);
+    font-weight: 600;
+    margin-bottom: 4px;
+    letter-spacing: 1px;
+    font-size: 13px;
+  }
+  .stats-rule { color: var(--text-mute); font-size: 10px; margin-bottom: 8px; user-select: none; }
+  .stat-row {
+    display: flex; justify-content: space-between;
+    padding: 2px 0; font-size: 12.5px;
+  }
+  .stat-row .label { color: var(--text-dim); }
+  .stat-row .value { color: var(--text); font-weight: 500; }
+  .stat-row .value.pos { color: var(--green); }
+  .stat-row .value.neg { color: var(--red); }
+  .stat-row .value.warn { color: var(--yellow); }
+  .stat-row .value.btc  { color: var(--btc); }
+  .stat-divider { height: 1px; background: var(--border); margin: 8px 0; }
+
+  /* ───────────────────────────────────────────────
+     HERO PANE
+     ─────────────────────────────────────────────── */
+  .hero {
+    position: relative; flex: 1;
+    overflow: hidden;
+    display: flex; align-items: center; justify-content: center;
+    min-height: 220px;
+    /* violet.jpg sebagai background — di-tint gelap agar tidak mencolok */
+    background:
+      linear-gradient(135deg, rgba(247,147,26,.08), transparent 55%),
+      linear-gradient(45deg, rgba(189,147,249,.06), transparent 55%),
+      url('/violet.jpg') center 30% / cover no-repeat;
+  }
+  /* Layer 1: tint gelap + blur agar teks tetap terbaca */
+  .hero::before {
+    content: '';
+    position: absolute; inset: 0;
+    background:
+      radial-gradient(circle at 30% 40%, rgba(247,147,26,.18), transparent 55%),
+      radial-gradient(circle at 70% 25%, rgba(189,147,249,.18), transparent 55%),
+      linear-gradient(180deg,
+        rgba(13,11,20,.55) 0%,
+        rgba(13,11,20,.30) 40%,
+        rgba(13,11,20,.65) 100%
+      );
+    /* desaturate + darken gambar tanpa backdrop-filter (compat) */
+    backdrop-filter: brightness(0.55) saturate(0.7);
+    -webkit-backdrop-filter: brightness(0.55) saturate(0.7);
+  }
+  /* Layer 2: fade halus di bawah untuk blend dengan pane */
+  .hero::after {
+    content: '';
+    position: absolute; bottom: 0; left: 0; right: 0; height: 40%;
+    background: linear-gradient(180deg, transparent 0%, rgba(13,11,20,.85) 100%);
+  }
+  .hero-content { position: relative; z-index: 2; text-align: center; padding: 20px; }
+  .hero-glyph { font-size: 11px; color: var(--btc); letter-spacing: 4px; margin-bottom: 10px; opacity: .8; }
+  .hero-name {
+    font-size: 44px; font-weight: 700; color: var(--text); letter-spacing: 2px; margin-bottom: 4px;
+    text-shadow: 0 0 28px rgba(247,147,26,.55), 0 2px 8px rgba(0,0,0,.9);
+  }
+  .hero-tagline { font-size: 12px; color: var(--orange-bright); letter-spacing: 3px; font-weight: 400; margin-bottom: 6px; }
+  .hero-jp { font-size: 11px; color: var(--text-dim); letter-spacing: 2px; opacity: .65; }
+  .hero-price {
+    margin-top: 14px;
+    font-size: 32px; font-weight: 700; color: var(--btc);
+    text-shadow: 0 0 16px rgba(247,147,26,.5);
+    letter-spacing: 1px;
+  }
+  .hero-price-change { font-size: 12px; margin-top: 2px; }
+  .hero-status {
+    margin-top: 10px;
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 12px;
+    background: rgba(80,250,123,.10);
+    border: 1px solid rgba(80,250,123,.30);
+    border-radius: 20px;
+    font-size: 10px; color: var(--green); letter-spacing: 1px;
+  }
+  .pulse {
+    width: 6px; height: 6px; background: var(--green); border-radius: 50%;
+    animation: pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(80,250,123,.6); opacity: 1; }
+    50%       { box-shadow: 0 0 0 6px rgba(80,250,123,0); opacity: .6; }
+  }
+
+  /* ───────────────────────────────────────────────
+     WINDOW / SIGNAL PANE
+     ─────────────────────────────────────────────── */
+  .window-countdown {
+    text-align: center; margin-bottom: 14px;
+  }
+  .window-countdown .label { font-size: 10px; color: var(--text-mute); letter-spacing: 2px; margin-bottom: 4px; }
+  .window-countdown .timer { font-size: 36px; font-weight: 700; color: var(--purple-bright); letter-spacing: 2px; }
+  .window-countdown .wstart { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+
+  .window-progress {
+    height: 4px; background: rgba(189,147,249,.15); border-radius: 2px; margin-bottom: 14px; overflow: hidden;
+  }
+  .window-progress-fill {
+    height: 100%; border-radius: 2px;
+    background: linear-gradient(90deg, var(--purple), var(--btc));
+    transition: width .5s linear;
+  }
+
+  .window-spread-display {
+    text-align: center; margin-bottom: 12px;
+  }
+  .window-spread-display .label { font-size: 10px; color: var(--text-mute); letter-spacing: 2px; margin-bottom: 3px; }
+  .window-spread-display .spread-val {
+    font-size: 28px; font-weight: 700; letter-spacing: 1px;
+    transition: color .3s;
+  }
+  .spread-val.up   { color: var(--green); }
+  .spread-val.down { color: var(--red); }
+  .spread-val.flat { color: var(--text-dim); }
+
+  .window-ptb { text-align: center; font-size: 12px; color: var(--text-dim); margin-bottom: 14px; }
+  .window-ptb span { color: var(--btc); font-weight: 600; }
+
+  /* Win Probability Meter */
+  .prob-section { margin-top: 10px; }
+  .prob-label { font-size: 10px; color: var(--text-mute); letter-spacing: 2px; margin-bottom: 6px; }
+  .prob-row { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+  .prob-bar-bg {
+    flex: 1; height: 6px; background: rgba(255,255,255,.06); border-radius: 3px; overflow: hidden;
+  }
+  .prob-bar-fill {
+    height: 100%; border-radius: 3px;
+    background: linear-gradient(90deg, var(--red), var(--yellow), var(--green));
+    transition: width .5s ease;
+  }
+  .prob-pct { font-size: 13px; font-weight: 700; min-width: 38px; text-align: right; }
+
+  .lock-badge {
+    margin-top: 10px;
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    padding: 8px 14px;
+    border-radius: 8px;
+    font-size: 12px; font-weight: 600; letter-spacing: 1px;
+    border: 1px solid;
+    transition: all .3s;
+  }
+  .lock-badge.armed {
+    background: rgba(255,85,85,.12);
+    border-color: rgba(255,85,85,.5);
+    color: var(--red);
+    animation: badge-pulse 0.8s ease-in-out infinite alternate;
+  }
+  .lock-badge.watching {
+    background: rgba(241,250,140,.07);
+    border-color: rgba(241,250,140,.25);
+    color: var(--yellow);
+  }
+  .lock-badge.waiting {
+    background: rgba(100,100,150,.08);
+    border-color: rgba(100,100,150,.2);
+    color: var(--text-mute);
+  }
+  @keyframes badge-pulse {
+    from { box-shadow: 0 0 0 0 rgba(255,85,85,0); }
+    to   { box-shadow: 0 0 20px rgba(255,85,85,.35); }
+  }
+
+  /* ───────────────────────────────────────────────
+     SIGNAL PANE (bottom-center)
+     ─────────────────────────────────────────────── */
+  .signal-grid {
+    display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 14px;
+  }
+  .sig-card {
+    background: rgba(255,255,255,.03);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 10px 8px;
+    text-align: center;
+  }
+  .sig-card .sig-lbl { font-size: 9px; color: var(--text-mute); letter-spacing: 1.5px; margin-bottom: 4px; }
+  .sig-card .sig-val { font-size: 18px; font-weight: 700; }
+  .sig-card .sig-sub { font-size: 9px; color: var(--text-dim); margin-top: 2px; }
+  .sig-val.pos { color: var(--green); }
+  .sig-val.neg { color: var(--red); }
+  .sig-val.warn { color: var(--yellow); }
+  .sig-val.btc  { color: var(--btc); }
+  .sig-val.purple { color: var(--purple-bright); }
+
+  .ev-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+  .ev-table th {
+    text-align: left; padding: 4px 6px;
+    color: var(--btc); font-weight: 600; border-bottom: 1px solid var(--border);
+    font-size: 10px; letter-spacing: .5px;
+  }
+  .ev-table td { padding: 3px 6px; border-bottom: 1px dashed rgba(189,147,249,.07); color: var(--text); }
+  .ev-table tr.active-row td { background: rgba(247,147,26,.06); color: var(--btc-dim); }
+  .ev-table tr.active-row td:first-child { color: var(--btc); font-weight: 600; }
+  .ev-table .pos { color: var(--green); }
+  .ev-table .neg { color: var(--red); }
+  .ev-table .warn { color: var(--yellow); }
+
+  /* ───────────────────────────────────────────────
+     HISTORY TABLE
+     ─────────────────────────────────────────────── */
+  .history-table {
+    width: 100%; border-collapse: collapse; font-size: 11px;
+  }
+  .history-table thead th {
+    text-align: left; color: var(--btc); font-weight: 600;
+    padding: 4px 5px; border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; background: #11111b; backdrop-filter: blur(20px);
+    font-size: 10px; letter-spacing: .5px;
+  }
+  .history-table td { padding: 3px 5px; border-bottom: 1px dashed rgba(250,179,135,.07); color: var(--text); }
+  .history-table tr:hover td { background: rgba(250,179,135,.04); }
+  .col-num { text-align: right; }
+  .col-muted { color: var(--text-mute); }
+  .col-win  { color: var(--green); font-weight: 600; }
+  .col-loss { color: var(--red); font-weight: 600; }
+  .col-skip { color: var(--text-mute); }
+  .col-up   { color: var(--green); }
+  .col-down { color: var(--red); }
+  .history-foot {
+    display: flex; justify-content: space-between;
+    margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--border);
+    color: var(--text-mute); font-size: 10px;
+  }
+
+  /* ───────────────────────────────────────────────
+     LOG PANE
+     ─────────────────────────────────────────────── */
+  .log-list { font-size: 11.5px; line-height: 1.55; }
+  .log-line { display: flex; gap: 7px; padding: 1px 0; white-space: nowrap; overflow: hidden; }
+  .log-ts  { color: var(--text-mute); flex-shrink: 0; font-size: 10px; }
+  .log-tag { flex-shrink: 0; font-weight: 600; min-width: 64px; font-size: 10.5px; }
+  .log-tag.INFO    { color: var(--cyan); }
+  .log-tag.SIGNAL  { color: var(--btc); }
+  .log-tag.LOCK    { color: var(--red); }
+  .log-tag.WIN     { color: var(--green); }
+  .log-tag.LOSS    { color: var(--red); }
+  .log-tag.SKIP    { color: var(--text-mute); }
+  .log-tag.WARN    { color: var(--yellow); }
+  .log-tag.WINDOW  { color: var(--purple); }
+  .log-msg { color: var(--text); overflow: hidden; text-overflow: ellipsis; font-size: 11px; }
+  .log-cursor {
+    display: inline-block; width: 7px; height: 12px;
+    background: var(--btc); vertical-align: text-bottom;
+    animation: blink 1s steps(2) infinite; margin-left: 2px;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  /* ───────────────────────────────────────────────
+     BOTTOM DOCK
+     ─────────────────────────────────────────────── */
+  .dock {
+    position: fixed; bottom: 13px; left: 50%;
+    transform: translateX(-50%);
+    display: flex; gap: 8px; padding: 6px 12px;
+    background: #11111b;
+    backdrop-filter: blur(20px);
+    border: 1px solid rgba(250,179,135,.15);
+    border-radius: 20px;
+    z-index: 50;
+    box-shadow: 0 8px 32px rgba(0,0,0,.6), 0 0 0 1px rgba(250,179,135,.05);
+  }
+  .dock-icon {
+    width: 34px; height: 34px;
+    display: grid; place-items: center;
+    border-radius: 8px; cursor: pointer;
+    font-size: 16px; transition: all .15s; color: var(--text-dim);
+  }
+  .dock-icon:hover { transform: translateY(-3px); }
+  .dock-icon.terminal { background: rgba(17,17,27,.9); color: var(--teal); border: 1px solid rgba(148,226,213,.25); }
+  .dock-icon.chart    { background: rgba(250,179,135,.85); color: #11111b; }
+  .dock-icon.signal   { background: rgba(243,139,168,.85); color: #11111b; }
+  .dock-icon.telegram { background: rgba(166,227,161,.85); color: #11111b; }
+  .dock-icon.btcico   { background: rgba(250,179,135,.15); color: var(--btc); border: 1px solid rgba(250,179,135,.35); }
+  .dock-icon.info     { background: rgba(137,220,235,.85); color: #11111b; }
+
+  /* ───────────────────────────────────────────────
+     RESPONSIVE
+     ─────────────────────────────────────────────── */
+  @media (max-width: 1150px) {
+    .desktop {
+      grid-template-columns: 1fr 1fr;
+      grid-template-rows: auto;
+    }
+    .pane-stats   { grid-column: 1; grid-row: 1; }
+    .pane-hero    { grid-column: 2; grid-row: 1; }
+    .pane-window  { grid-column: 1; grid-row: 2; }
+    .pane-signal  { grid-column: 2; grid-row: 2; }
+    .pane-logs    { grid-column: 1; grid-row: 3; }
+    .pane-history { grid-column: 2; grid-row: 3; }
+  }
+  @media (max-width: 720px) {
+    .desktop { grid-template-columns: 1fr; }
+    .pane-stats, .pane-hero, .pane-window, .pane-signal, .pane-logs, .pane-history {
+      grid-column: 1; grid-row: auto;
+    }
+    .hero-name { font-size: 32px; }
+    .hero-price { font-size: 24px; }
+  }
+</style>
+</head>
+<body>
+
+<!-- TOP BAR -->
+<div class="topbar">
+  <div class="workspaces">
+    <a class="ws ws-home" href="http://43.134.160.161:3003" title="Hub" style="text-decoration:none;">🏠</a>
+    <span class="ws-sep">│</span>
+    <a class="ws" href="http://43.134.160.161:3000" title="Meridian" style="text-decoration:none;">1</a>
+    <a class="ws" href="http://43.134.160.161:3001" title="Charon" style="text-decoration:none;">2</a>
+    <a class="ws active" href="http://43.134.160.161:3456" title="Polylock" style="text-decoration:none;">3</a>
+    <a class="ws" href="http://43.134.160.161:3002" title="Confluence" style="text-decoration:none;">4</a>
+    <a class="ws" href="http://43.134.160.161:3005" title="Dexamev" style="text-decoration:none;">5</a>
+  </div>
+  <div class="topbar-title"><div class="topbar-title-inner">PolyLock · BTC 5m</div></div>
+  <div class="topbar-right">
+    <div class="tr-pill">
+      <span class="hot">₿ <span id="tb-btc">—</span></span>
+      <span><span class="live-dot"></span>LIVE</span>
+    </div>
+    <div class="clock-pill" id="tb-clock">—</div>
+  </div>
+</div>
+
+<!-- DESKTOP GRID -->
+<div class="desktop">
+
+  <!-- ── STATS PANE ─────────────────────────────── -->
+  <div class="pane pane-stats">
+    <div class="pane-header">
+      <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+      <span class="user">polylock</span><span class="at">@</span><span class="host">btc-5m</span>
+      <span class="prompt">$</span><span class="cmd">bot --stats</span>
+    </div>
+    <div class="pane-body">
+      <div class="stats-title">PolyLock</div>
+      <div class="stats-rule">───────────────────────────────</div>
+
+      <div class="stat-row"><span class="label">Mode:</span><span class="value warn" id="s-mode">PAPER</span></div>
+      <div class="stat-row"><span class="label">Bankroll:</span><span class="value btc" id="s-bankroll">$10.00</span></div>
+      <div class="stat-row"><span class="label">Time UTC:</span><span class="value" id="s-time">—</span></div>
+      <div class="stat-row"><span class="label">Windows:</span><span class="value" id="s-windows">0 tracked</span></div>
+
+      <div class="stat-divider"></div>
+      <div class="stat-row"><span class="label">Trades Today:</span><span class="value" id="s-trades">0</span></div>
+      <div class="stat-row"><span class="label">Win / Loss:</span><span class="value" id="s-wl">0 / 0</span></div>
+      <div class="stat-row"><span class="label">Win Rate:</span><span class="value" id="s-wr">—%</span></div>
+      <div class="stat-row"><span class="label">P&amp;L Today:</span><span class="value" id="s-pnl">$0.00</span></div>
+      <div class="stat-row"><span class="label">Avg Spread:</span><span class="value" id="s-avg-spread">$—</span></div>
+
+      <div class="stat-divider"></div>
+      <div class="stat-row"><span class="label">LOCK Threshold:</span><span class="value btc">$50</span></div>
+      <div class="stat-row"><span class="label">Alert Window:</span><span class="value">Min 4:00–4:55</span></div>
+      <div class="stat-row"><span class="label">Fee Rate:</span><span class="value">2.0%</span></div>
+      <div class="stat-row"><span class="label">Break-even WR:</span><span class="value warn">~72–82%</span></div>
+    </div>
+  </div>
+
+  <!-- ── HERO PANE ──────────────────────────────── -->
+  <div class="pane pane-hero">
+    <div class="pane-header">
+      <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+      <span class="user">polylock</span><span class="at">@</span><span class="host">btc-5m</span>
+      <span class="prompt">$</span><span class="cmd">btc --live</span>
+    </div>
+    <div class="hero">
+      <div class="hero-content">
+        <div class="hero-glyph">◆ ◇ ◆ ◇ ◆</div>
+        <div class="hero-name">PolyLock</div>
+        <div class="hero-tagline">BTC 5m LOCK Strategy</div>
+        <div class="hero-jp">₿ ロック戦略 · ポリマーケット</div>
+        <div class="hero-price" id="hero-btc">$—</div>
+        <div class="hero-price-change">
+          <span id="hero-spread-lbl" style="color:var(--text-dim);font-size:11px">spread from PTB: </span>
+          <span id="hero-spread" style="color:var(--text-dim);font-size:13px;font-weight:600">—</span>
+        </div>
+        <div class="hero-status">
+          <span class="pulse"></span>
+          <span id="hero-status-text">MONITORING · <span id="price-source-label">Chainlink</span></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── WINDOW PANE (top-right) ────────────────── -->
+  <div class="pane pane-window" id="pane-window">
+    <div class="pane-header">
+      <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+      <span class="user">polylock</span><span class="at">@</span><span class="host">btc-5m</span>
+      <span class="prompt">$</span><span class="cmd">window --live</span>
+    </div>
+    <div class="pane-body">
+      <div class="window-countdown">
+        <div class="label">TIME IN WINDOW</div>
+        <div class="timer" id="w-elapsed">0:00</div>
+        <div class="wstart">Started: <span id="w-start">—</span></div>
+      </div>
+
+      <div class="window-progress">
+        <div class="window-progress-fill" id="w-progress" style="width:0%"></div>
+      </div>
+
+      <div class="window-ptb">PTB: <span id="w-ptb">$—</span></div>
+
+      <div class="window-spread-display">
+        <div class="label">CURRENT SPREAD</div>
+        <div class="spread-val flat" id="w-spread">$0.00</div>
+        <div style="font-size:10px;color:var(--text-mute);margin-top:3px" id="w-direction">——</div>
+      </div>
+
+      <div class="prob-section">
+        <div class="prob-label">WIN PROBABILITY ESTIMATE</div>
+        <div class="prob-row">
+          <div class="prob-bar-bg"><div class="prob-bar-fill" id="prob-fill" style="width:50%"></div></div>
+          <div class="prob-pct" id="prob-pct" style="color:var(--text-dim)">—%</div>
+        </div>
+        <div style="font-size:10px;color:var(--text-dim);margin-bottom:8px" id="prob-note">Requires ≥$100 spread at min 4</div>
+
+        <div class="lock-badge waiting" id="lock-badge">
+          <span id="lock-badge-icon">⏳</span>
+          <span id="lock-badge-text">WAITING FOR MIN 4</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── LOG PANE (bottom-left) ─────────────────── -->
+  <div class="pane pane-logs">
+    <div class="pane-header">
+      <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+      <span class="user">polylock</span><span class="at">@</span><span class="host">btc-5m</span>
+      <span class="prompt">$</span><span class="cmd">tail -f lock.log</span>
+    </div>
+    <div class="pane-body">
+      <div class="log-list" id="log-body">
+        <div class="log-line">
+          <span class="log-ts">--:--:--</span>
+          <span class="log-tag INFO">INFO</span>
+          <span class="log-msg">Initializing PolyLock dashboard…<span class="log-cursor"></span></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── SIGNAL / EV TABLE PANE (bottom-center) ─── -->
+  <div class="pane pane-signal">
+    <div class="pane-header">
+      <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+      <span class="user">polylock</span><span class="at">@</span><span class="host">btc-5m</span>
+      <span class="prompt">$</span><span class="cmd">signal --ev-table</span>
+    </div>
+    <div class="pane-body">
+      <div class="signal-grid">
+        <div class="sig-card">
+          <div class="sig-lbl">BTC PRICE</div>
+          <div class="sig-val btc" id="sig-price">—</div>
+          <div class="sig-sub">USDT</div>
+        </div>
+        <div class="sig-card">
+          <div class="sig-lbl">VOL RATIO</div>
+          <div class="sig-val" id="sig-vol">—x</div>
+          <div class="sig-sub">vs 10-bar avg</div>
+        </div>
+        <div class="sig-card">
+          <div class="sig-lbl">MOMENTUM</div>
+          <div class="sig-val" id="sig-mom">—%</div>
+          <div class="sig-sub">1m change</div>
+        </div>
+      </div>
+
+      <div style="font-size:10px;color:var(--btc);letter-spacing:2px;margin-bottom:6px;">EXPECTED VALUE TABLE</div>
+      <table class="ev-table">
+        <thead>
+          <tr>
+            <th>Spread</th>
+            <th>Entry</th>
+            <th>Win%</th>
+            <th>EV/share</th>
+            <th>Signal</th>
+          </tr>
+        </thead>
+        <tbody id="ev-body">
+          <tr>
+            <td>$50–$70</td>
+            <td>0.65</td>
+            <td class="neg">72%</td>
+            <td class="neg">-$0.013</td>
+            <td class="neg">✗ SKIP</td>
+          </tr>
+          <tr>
+            <td>$70–$110</td>
+            <td>0.70–0.75</td>
+            <td class="warn">78–82%</td>
+            <td class="warn">+$0.058</td>
+            <td class="warn">⚠ MARGINAL</td>
+          </tr>
+          <tr>
+            <td>$110–$160</td>
+            <td>0.78–0.83</td>
+            <td class="pos">86–90%</td>
+            <td class="pos">+$0.064</td>
+            <td class="pos">✓ OK</td>
+          </tr>
+          <tr>
+            <td>$160+</td>
+            <td>0.87–0.91</td>
+            <td class="pos">93–95%</td>
+            <td class="pos">+$0.042</td>
+            <td class="pos">✓ STRONG</td>
+          </tr>
+        </tbody>
+      </table>
+      <div style="font-size:9.5px;color:var(--text-mute);margin-top:8px;line-height:1.6">
+        EV = (winProb × 1.0) − (entry × 1.02)<br>
+        Break-even: entry 0.65 needs WR ≥ 72% | entry 0.78 needs WR ≥ 82%
+      </div>
+    </div>
+  </div>
+
+  <!-- ── HISTORY PANE (bottom-right) ──────────────── -->
+  <div class="pane pane-history">
+    <div class="pane-header">
+      <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+      <span class="user">polylock</span><span class="at">@</span><span class="host">btc-5m</span>
+      <span class="prompt">$</span><span class="cmd">history --windows</span>
+    </div>
+    <div class="pane-body">
+      <table class="history-table">
+        <thead>
+          <tr>
+            <th>Window</th>
+            <th class="col-num">Spread</th>
+            <th>Dir</th>
+            <th>Result</th>
+            <th class="col-num">P&amp;L</th>
+          </tr>
+        </thead>
+        <tbody id="history-body">
+          <tr><td colspan="5" style="text-align:center;padding:16px;color:var(--text-mute)">waiting for windows…</td></tr>
+        </tbody>
+      </table>
+      <div class="history-foot">
+        <span id="hist-count">0 windows tracked</span>
+        <span>Updated: <span id="hist-updated">—</span></span>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- BOTTOM DOCK -->
+<div class="dock">
+  <div class="dock-icon terminal" title="Open Web Terminal" onclick="openTerminal()">⌘</div>
+  <div class="dock-icon btcico"   title="Bitcoin">₿</div>
+  <div class="dock-icon chart"    title="Chart">📊</div>
+  <div class="dock-icon signal"   title="Signal">🚨</div>
+  <div class="dock-icon telegram" title="Telegram">💬</div>
+  <div class="dock-icon info"     title="Info">ℹ</div>
+</div>
+
+<!-- TERMINAL MODAL -->
+<div id="term-overlay" style="display:none;position:fixed;inset:0;z-index:200;background:rgba(0,0,0,.75);backdrop-filter:blur(6px);align-items:center;justify-content:center;">
+  <div style="width:92vw;height:85vh;max-width:1100px;background:var(--bg-pane);border:1px solid var(--border-hot);border-radius:12px;overflow:hidden;display:flex;flex-direction:column;box-shadow:0 24px 64px rgba(0,0,0,.8);">
+    <div style="display:flex;align-items:center;gap:8px;padding:8px 14px;background:var(--bg-header);border-bottom:1px solid var(--border);">
+      <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#ff6b81"></span>
+      <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#f1fa8c"></span>
+      <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#50fa7b"></span>
+      <span style="color:var(--cyan);font-size:11px;margin-left:8px;">root@polylock</span>
+      <span style="color:var(--text-mute);font-size:11px;">~ $</span>
+      <span style="color:var(--text);font-size:11px;">bash</span>
+      <span style="flex:1"></span>
+      <span style="color:var(--text-mute);font-size:10px;">port 3457</span>
+      <button onclick="closeTerminal()" style="background:rgba(255,85,85,.15);border:1px solid rgba(255,85,85,.3);color:var(--red);border-radius:6px;padding:2px 10px;cursor:pointer;font-family:inherit;font-size:11px;margin-left:10px;">✕ close</button>
+    </div>
+    <iframe id="term-frame" src="" style="flex:1;border:none;background:#0d0b14;"></iframe>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════
+       SCRIPTS
+     ═══════════════════════════════════════════════════ -->
+<script>
+// ─── CONFIG ────────────────────────────────────────────
+const BINANCE_PRICE_URL  = 'https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT';
+const BINANCE_KLINES_URL = 'https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=20';
+
+// BTC price via server-side proxy — no CORS, server polls Chainlink every 5s
+const SPREAD_THRESHOLD   = 50;
+const FEE_RATE           = 0.02;
+const LOCK_START_SEC     = 4 * 60;       // 240s
+const LOCK_END_SEC       = 4 * 60 + 55; // 295s
+const WINDOW_DURATION    = 300;          // 5 minutes
+
+// ─── STATE ─────────────────────────────────────────────
+let state = {
+  btcPrice: 0,
+  prevBtcPrice: 0,
+  windowStart: null,
+  ptb: 0,
+  spread: 0,
+  secondsInto: 0,
+  lockAlerted: false,
+  windowsTracked: [],
+  currentWindow: null,
+  daily: { trades: 0, wins: 0, losses: 0, profit: 0 },
+  bankroll: 10.00,
+  initialBankroll: 10.00,
+  signal: { volRatio: 1, momentum: 0 },
+};
+
+// ─── HELPERS ───────────────────────────────────────────
+const fmt2 = (n) => n == null || isNaN(n) ? '—' : Number(n).toLocaleString('en-US', {minimumFractionDigits:2,maximumFractionDigits:2});
+const fmtK = (n) => { if (n >= 1e6) return (n/1e6).toFixed(1)+'M'; if (n >= 1e3) return (n/1e3).toFixed(0)+'K'; return fmt2(n); };
+
+function utcHHMMSS(d = new Date()) {
+  return d.getUTCHours().toString().padStart(2,'0') + ':' +
+         d.getUTCMinutes().toString().padStart(2,'0') + ':' +
+         d.getUTCSeconds().toString().padStart(2,'0');
+}
+function utcHHMM(d = new Date()) {
+  return d.getUTCHours().toString().padStart(2,'0') + ':' +
+         d.getUTCMinutes().toString().padStart(2,'0');
+}
+function formatMinSec(sec) {
+  const m = Math.floor(sec / 60);
+  const s = Math.floor(sec % 60);
+  return m + ':' + s.toString().padStart(2,'0');
+}
+
+// ─── WIN PROBABILITY ───────────────────────────────────
+function estimateWinProb(absSpread) {
+  if (absSpread < 50)  return 0.50;
+  if (absSpread < 70)  return 0.72;
+  if (absSpread < 90)  return 0.78;
+  if (absSpread < 110) return 0.82;
+  if (absSpread < 130) return 0.86;
+  if (absSpread < 160) return 0.90;
+  if (absSpread < 200) return 0.93;
+  return 0.95;
+}
+
+function estimateEntryPrice(absSpread) {
+  if (absSpread < 50)  return 0.50;
+  if (absSpread < 70)  return 0.65;
+  if (absSpread < 90)  return 0.70;
+  if (absSpread < 110) return 0.75;
+  if (absSpread < 130) return 0.78;
+  if (absSpread < 160) return 0.83;
+  if (absSpread < 200) return 0.87;
+  return 0.91;
+}
+
+function calcEV(entryPrice, winProb) {
+  return (winProb * 1.0) - (entryPrice * (1 + FEE_RATE));
+}
+
+// ─── WINDOW MANAGEMENT ─────────────────────────────────
+function getWindowStart(now) {
+  const wn = Math.floor(now.getUTCMinutes() / 5);
+  const ws = new Date(now);
+  ws.setUTCMinutes(wn * 5, 0, 0);
+  return ws;
+}
+
+function updateWindowState(now, btcPrice) {
+  const ws = getWindowStart(now);
+  const wsKey = ws.toISOString();
+
+  // New window
+  if (!state.windowStart || state.windowStart.toISOString() !== wsKey) {
+    // Close old window
+    if (state.currentWindow) {
+      const cw = state.currentWindow;
+      if (!cw.result) cw.result = 'SKIP';
+      cw.finalSpread = btcPrice - cw.ptb;
+      addLog('WINDOW', `Closed ${utcHHMM(cw.start)} | Spread: ${cw.finalSpread>=0?'+':''}$${Math.abs(cw.finalSpread).toFixed(0)} | ${cw.result}`);
+      state.windowsTracked.unshift(cw);
+      if (state.windowsTracked.length > 50) state.windowsTracked.pop();
+    }
+
+    state.windowStart = ws;
+    state.ptb = btcPrice;
+    state.lockAlerted = false;
+    state.currentWindow = {
+      start: ws, ptb: btcPrice,
+      spread: 0, direction: '—', result: '',
+      entryPrice: 0, size: 0, locked: false,
+    };
+
+    addLog('WINDOW', `New window opened ${utcHHMM(ws)} | PTB: $${fmtK(btcPrice)}`);
+    document.getElementById('pane-window').classList.remove('pane-alert');
+  }
+
+  state.spread = btcPrice - state.ptb;
+  // Sanity: spread > $500 berarti PTB atau price salah — reset PTB
+  if (Math.abs(state.spread) > 500) {
+    console.warn(`[PTB RESET] absSpread=${Math.abs(state.spread).toFixed(0)} too large, resetting PTB to current price`);
+    state.ptb = btcPrice;
+    state.spread = 0;
+    if (state.currentWindow) state.currentWindow.ptb = btcPrice;
+  }
+  state.secondsInto = (now - state.windowStart) / 1000;
+  if (state.currentWindow) {
+    state.currentWindow.spread = state.spread;
+    state.currentWindow.direction = state.spread > 0 ? 'UP' : state.spread < 0 ? 'DOWN' : 'FLAT';
+  }
+}
+
+// ─── FETCH PRICE ───────────────────────────────────────
+async function fetchBTC() {
+  // Fetch dari server-side proxy — server yang poll Chainlink tiap 5s, no CORS
+  try {
+    const r = await fetch('/api/btc-price', { cache: 'no-store' });
+    const d = await r.json();
+    if (d.price > 1000) {
+      state.priceSource = d.source || 'Chainlink';
+      return d.price;
+    }
+  } catch {}
+  // Last-resort: Binance langsung dari browser
+  try {
+    const r = await fetch(BINANCE_PRICE_URL, { cache: 'no-store' });
+    const d = await r.json();
+    state.priceSource = 'Binance (fallback)';
+    return parseFloat(d.price);
+  } catch { return 0; }
+}
+
+async function fetchSignal() {
+  try {
+    const r = await fetch(BINANCE_KLINES_URL, {cache:'no-store'});
+    const data = await r.json();
+    if (!data || data.length < 8) return;
+    const closes = data.map(c => parseFloat(c[4]));
+    const vols   = data.map(c => parseFloat(c[5]));
+
+    // FIX: gunakan avg 3 candle complete (bukan vols[-1] yang masih incomplete)
+    // vols[-1] = candle sekarang (5 detik dari 60 → hanya 8% volume → selalu kelihatan rendah)
+    const completeVols = vols.slice(0, -1); // buang candle terakhir yang masih berjalan
+    const curVol = (completeVols.slice(-3).reduce((a,b) => a+b, 0)) / 3;
+    const avgVol = completeVols.slice(-10).reduce((a,b) => a+b, 0) / 10;
+
+    // 3-candle slope pada complete candles
+    const cc = closes.slice(0, -1);
+    const avgRecent = cc.slice(-3).reduce((a,b) => a+b, 0) / 3;
+    const avgBefore = cc.slice(-6,-3).reduce((a,b) => a+b, 0) / 3;
+    const mom = avgBefore > 0 ? ((avgRecent - avgBefore) / avgBefore) * 100 : 0;
+
+    state.signal = { volRatio: avgVol > 0 ? curVol/avgVol : 1, momentum: mom };
+  } catch {}
+}
+
+// ─── LOG ───────────────────────────────────────────────
+const MAX_LOGS = 60;
+let logLines = [];
+
+function addLog(tag, msg) {
+  const ts = utcHHMMSS();
+  logLines.push({ ts, tag, msg });
+  if (logLines.length > MAX_LOGS) logLines.shift();
+  renderLogs();
+}
+
+function renderLogs() {
+  const el = document.getElementById('log-body');
+  el.innerHTML = [...logLines].reverse().map(l => `
+    <div class="log-line">
+      <span class="log-ts">${l.ts}</span>
+      <span class="log-tag ${l.tag}">${l.tag}</span>
+      <span class="log-msg">${l.msg}</span>
+    </div>
+  `).join('') + '<div class="log-line"><span class="log-msg"><span class="log-cursor"></span></span></div>';
+}
+
+// ─── LOAD HISTORY FROM SERVER ──────────────────────────
+async function loadServerHistory() {
+  try {
+    const r = await fetch('/api/windows', { cache: 'no-store' });
+    const windows = await r.json();
+    if (!Array.isArray(windows) || !windows.length) return;
+    // Merge ke state.windowsTracked (server is source of truth)
+    state.windowsTracked = windows.map(w => ({
+      start:       new Date(w.start),
+      ptb:         w.ptb,
+      direction:   w.direction,
+      traded:      w.traded,
+      entryPrice:  w.entry_price,
+      size:        w.size,
+      finalSpread: w.final_spread,
+      result:      w.result,
+    }));
+    renderHistory();
+  } catch {}
+}
+
+async function loadServerStats() {
+  try {
+    const r = await fetch('/api/stats', { cache: 'no-store' });
+    const d = await r.json();
+    if (!d || !d.date) return;
+    state.daily.trades  = d.trades  || 0;
+    state.daily.wins    = d.wins    || 0;
+    state.daily.losses  = d.losses  || 0;
+    state.daily.profit  = d.profit  || 0;
+    state.bankroll      = d.bankroll || state.bankroll;
+  } catch {}
+}
+
+// ─── HISTORY TABLE ─────────────────────────────────────
+function renderHistory() {
+  const tbody = document.getElementById('history-body');
+  if (!state.windowsTracked.length) {
+    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:16px;color:var(--text-mute)">no completed windows yet…</td></tr>';
+    document.getElementById('hist-count').textContent = '0 windows tracked';
+    return;
+  }
+  tbody.innerHTML = state.windowsTracked.slice(0,40).map(w => {
+    const fs       = w.finalSpread ?? w.final_spread ?? 0;
+    const ep       = w.entryPrice  ?? w.entry_price  ?? 0;
+    const sz       = w.size ?? 0;
+    const dir      = w.direction || '—';
+    const res      = w.result    || 'PENDING';
+    const spreadStr = (fs >= 0 ? '+' : '') + '$' + Math.abs(fs).toFixed(0);
+    const dirCls    = dir === 'UP' ? 'col-up' : dir === 'DOWN' ? 'col-down' : 'col-muted';
+    const resCls    = res === 'WIN' ? 'col-win' : res === 'LOSS' ? 'col-loss' : res === 'PENDING' ? 'col-skip' : 'col-skip';
+    const pl = res === 'WIN'
+      ? '+$' + ((sz * (1 - ep)) - sz * ep * FEE_RATE).toFixed(2)
+      : res === 'LOSS'
+      ? '-$' + (sz * ep * (1 + FEE_RATE)).toFixed(2)
+      : '—';
+    const startDt = w.start instanceof Date ? w.start : new Date(w.start);
+    return `<tr>
+      <td class="col-muted">${utcHHMM(startDt)}</td>
+      <td class="col-num">${spreadStr}</td>
+      <td class="${dirCls}">${dir}</td>
+      <td class="${resCls}">${res}</td>
+      <td class="col-num ${res==='WIN'?'col-win':res==='LOSS'?'col-loss':''}">${pl}</td>
+    </tr>`;
+  }).join('');
+  document.getElementById('hist-count').textContent = state.windowsTracked.length + ' windows tracked';
+  document.getElementById('hist-updated').textContent = utcHHMMSS();
+}
+
+// ─── MAIN RENDER ───────────────────────────────────────
+function renderAll(now) {
+  const btcPrice = state.btcPrice;
+  const spread   = state.spread;
+  const absSpread = Math.abs(spread);
+  const sec      = state.secondsInto;
+  const inLockWindow = sec >= LOCK_START_SEC && sec <= LOCK_END_SEC;
+
+  // Top bar
+  document.getElementById('tb-btc').textContent = '$' + fmtK(btcPrice);
+  document.getElementById('tb-clock').textContent = utcHHMMSS(now) + ' UTC';
+
+  // Stats
+  const wr = state.daily.wins + state.daily.losses > 0
+    ? ((state.daily.wins / (state.daily.wins + state.daily.losses)) * 100).toFixed(1) + '%'
+    : '—%';
+  const pnlEl = document.getElementById('s-pnl');
+  pnlEl.textContent = (state.daily.profit >= 0 ? '+' : '') + '$' + Math.abs(state.daily.profit).toFixed(2);
+  pnlEl.className = 'value ' + (state.daily.profit > 0 ? 'pos' : state.daily.profit < 0 ? 'neg' : '');
+
+  document.getElementById('s-bankroll').textContent = '$' + state.bankroll.toFixed(2);
+  document.getElementById('s-time').textContent = utcHHMMSS(now) + ' UTC';
+  document.getElementById('s-windows').textContent = state.windowsTracked.length + ' tracked';
+  document.getElementById('s-trades').textContent = state.daily.trades;
+  document.getElementById('s-wl').textContent = state.daily.wins + ' / ' + state.daily.losses;
+  document.getElementById('s-wr').textContent = wr;
+
+  // Price source label
+  const srcEl = document.getElementById('price-source-label');
+  if (srcEl) srcEl.textContent = state.priceSource || 'Chainlink';
+
+  // Hero
+  const priceEl = document.getElementById('hero-btc');
+  priceEl.textContent = '$' + btcPrice.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+  const spreadEl = document.getElementById('hero-spread');
+  if (state.ptb > 0) {
+    spreadEl.textContent = (spread >= 0 ? '+' : '') + '$' + Math.abs(spread).toFixed(2);
+    spreadEl.style.color = spread > 50 ? 'var(--green)' : spread < -50 ? 'var(--red)' : 'var(--text-dim)';
+  }
+
+  // Window pane
+  document.getElementById('w-elapsed').textContent = formatMinSec(sec);
+  document.getElementById('w-start').textContent = state.windowStart ? utcHHMMSS(state.windowStart) : '—';
+  document.getElementById('w-ptb').textContent = state.ptb > 0 ? '$' + btcPrice ? '$' + state.ptb.toLocaleString('en-US',{minimumFractionDigits:2}) : '—' : '—';
+  document.getElementById('w-progress').style.width = Math.min(100, (sec / WINDOW_DURATION) * 100).toFixed(1) + '%';
+
+  const spreadDispEl = document.getElementById('w-spread');
+  spreadDispEl.textContent = (spread >= 0 ? '+' : '') + '$' + Math.abs(spread).toFixed(2);
+  spreadDispEl.className = 'spread-val ' + (spread > 0 ? 'up' : spread < 0 ? 'down' : 'flat');
+
+  const dirEl = document.getElementById('w-direction');
+  dirEl.textContent = spread > 0 ? '▲ UP — BTC above PTB' : spread < 0 ? '▼ DOWN — BTC below PTB' : '— FLAT';
+  dirEl.style.color = spread > 0 ? 'var(--green)' : spread < 0 ? 'var(--red)' : 'var(--text-mute)';
+
+  // Win probability
+  const winProb = inLockWindow && absSpread >= SPREAD_THRESHOLD ? estimateWinProb(absSpread) : null;
+  const probFill = document.getElementById('prob-fill');
+  const probPct  = document.getElementById('prob-pct');
+  const probNote = document.getElementById('prob-note');
+  if (winProb !== null) {
+    probFill.style.width = (winProb * 100).toFixed(0) + '%';
+    probPct.textContent  = (winProb * 100).toFixed(0) + '%';
+    probPct.style.color  = winProb >= 0.82 ? 'var(--green)' : winProb >= 0.70 ? 'var(--yellow)' : 'var(--red)';
+    const ev = calcEV(estimateEntryPrice(absSpread), winProb);
+    probNote.textContent = 'EV: ' + (ev >= 0 ? '+' : '') + '$' + ev.toFixed(4) + '/share · Entry: ' + estimateEntryPrice(absSpread).toFixed(2);
+    probNote.style.color = ev >= 0 ? 'var(--green)' : 'var(--red)';
+  } else {
+    probFill.style.width = '0%';
+    probPct.textContent  = '—%';
+    probPct.style.color  = 'var(--text-mute)';
+    probNote.textContent = inLockWindow ? 'Spread < $50 — no signal' : 'Requires min 4:00–4:55';
+    probNote.style.color = 'var(--text-mute)';
+  }
+
+  // Lock badge
+  const badge = document.getElementById('lock-badge');
+  const badgeIcon = document.getElementById('lock-badge-icon');
+  const badgeText = document.getElementById('lock-badge-text');
+  const paneWin  = document.getElementById('pane-window');
+  if (inLockWindow && absSpread >= SPREAD_THRESHOLD) {
+    badge.className = 'lock-badge armed';
+    badgeIcon.textContent = '🚨';
+    badgeText.textContent = 'LOCK ARMED — ' + (spread > 0 ? 'BUY UP' : 'BUY DOWN');
+    paneWin.classList.add('pane-alert');
+  } else if (inLockWindow) {
+    badge.className = 'lock-badge watching';
+    badgeIcon.textContent = '👁';
+    badgeText.textContent = 'WATCHING — Spread $' + absSpread.toFixed(0) + ' / $50';
+    paneWin.classList.remove('pane-alert');
+  } else if (sec > LOCK_END_SEC) {
+    badge.className = 'lock-badge waiting';
+    badgeIcon.textContent = '✔';
+    badgeText.textContent = 'WINDOW CLOSING';
+    paneWin.classList.remove('pane-alert');
+  } else {
+    badge.className = 'lock-badge waiting';
+    badgeIcon.textContent = '⏳';
+    badgeText.textContent = 'WAITING — min 4:00';
+    paneWin.classList.remove('pane-alert');
+  }
+
+  // Signal cards
+  const sigPrice = document.getElementById('sig-price');
+  sigPrice.textContent = '$' + fmtK(btcPrice);
+  const volEl = document.getElementById('sig-vol');
+  volEl.textContent = state.signal.volRatio.toFixed(2) + 'x';
+  volEl.className   = 'sig-val ' + (state.signal.volRatio >= 0.5 ? 'pos' : 'neg');
+  const momEl = document.getElementById('sig-mom');
+  momEl.textContent = (state.signal.momentum >= 0 ? '+' : '') + state.signal.momentum.toFixed(3) + '%';
+  momEl.className   = 'sig-val ' + (Math.abs(state.signal.momentum) < 0.1 ? 'warn' : state.signal.momentum > 0 ? 'pos' : 'neg');
+
+  // Avg spread stat
+  const completedSpreads = state.windowsTracked.filter(w => w.finalSpread !== undefined);
+  if (completedSpreads.length > 0) {
+    const avg = completedSpreads.reduce((s, w) => s + Math.abs(w.finalSpread), 0) / completedSpreads.length;
+    document.getElementById('s-avg-spread').textContent = '$' + avg.toFixed(0);
+  }
+
+  renderHistory();
+}
+
+// ─── MAIN LOOP ─────────────────────────────────────────
+let tickCount = 0;
+
+async function tick() {
+  const now = new Date();
+  const btcPrice = await fetchBTC();
+  if (btcPrice > 0) {
+    state.prevBtcPrice = state.btcPrice;
+    state.btcPrice = btcPrice;
+    updateWindowState(now, btcPrice);
+
+    // Fetch signal every 30 ticks (~60s)
+    if (tickCount % 12 === 0) {
+      await fetchSignal();
+    }
+
+    // Log signal every minute-ish
+    if (tickCount % 12 === 1 && state.ptb > 0) {
+      const sp = state.spread;
+      const si = Math.floor(state.secondsInto);
+      addLog('INFO', `BTC $${fmtK(btcPrice)} | Spread: ${sp>=0?'+':''}$${Math.abs(sp).toFixed(0)} | Min ${Math.floor(si/60)}:${(si%60).toString().padStart(2,'0')}`);
+    }
+
+    // LOCK alert
+    const si = state.secondsInto;
+    const absSpread = Math.abs(state.spread);
+    if (!state.lockAlerted && si >= LOCK_START_SEC && si <= LOCK_END_SEC) {
+      if (absSpread >= SPREAD_THRESHOLD) {
+        state.lockAlerted = true;
+        const ep = estimateEntryPrice(absSpread);
+        const wp = estimateWinProb(absSpread);
+        const ev = calcEV(ep, wp);
+        const dir = state.spread > 0 ? 'UP' : 'DOWN';
+        addLog('LOCK', `🚨 LOCK! Spread: ${state.spread>=0?'+':''}$${absSpread.toFixed(0)} | ${dir} | Entry: ${ep} | WP: ${(wp*100).toFixed(0)}% | EV: ${ev>=0?'+':''}$${ev.toFixed(4)}`);
+        addLog('SIGNAL', `Vol: ${state.signal.volRatio.toFixed(2)}x | Mom: ${state.signal.momentum>=0?'+':''}${state.signal.momentum.toFixed(3)}%`);
+        if (state.currentWindow) {
+          state.currentWindow.locked = true;
+          state.currentWindow.direction = dir;
+          state.currentWindow.entryPrice = ep;
+          state.currentWindow.size = Math.min(state.bankroll * 0.25, 5.0);
+          state.currentWindow.result = 'PENDING';
+        }
+        // Update topbar flash
+        document.getElementById('hero-status-text').textContent = `🚨 LOCK ARMED · ${dir} · $${absSpread.toFixed(0)} spread`;
+      }
+    }
+  } else {
+    addLog('WARN', 'Price fetch failed — retrying…');
+  }
+
+  tickCount++;
+  renderAll(now);
+}
+
+// ─── TERMINAL MODAL ────────────────────────────────────
+function openTerminal() {
+  const overlay = document.getElementById('term-overlay');
+  const frame   = document.getElementById('term-frame');
+  overlay.style.display = 'flex';
+  // ttyd runs on port 3457 same host
+  if (!frame.src || frame.src === window.location.href) {
+    frame.src = `/terminal/?token=polylock2025`;
+  }
+}
+function closeTerminal() {
+  document.getElementById('term-overlay').style.display = 'none';
+}
+// Close on overlay click
+document.getElementById('term-overlay').addEventListener('click', function(e) {
+  if (e.target === this) closeTerminal();
+});
+// ESC to close
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeTerminal(); });
+
+// ─── INIT ──────────────────────────────────────────────
+(async function init() {
+  addLog('INFO', 'PolyLock Dashboard started');
+  addLog('INFO', 'Loading history from bot logs…');
+
+  // Load persistent data dari server dulu sebelum tick pertama
+  await Promise.all([loadServerHistory(), loadServerStats()]);
+
+  addLog('INFO', `Loaded ${state.windowsTracked.length} windows from log`);
+  addLog('INFO', 'Connecting to Chainlink feed (Polygon)…');
+  addLog('INFO', 'LOCK threshold: $50 | Alert window: min 4:00–4:55');
+
+  await tick();
+  setInterval(tick, 5000);
+
+  // Sync history & stats dari server setiap 10 detik
+  setInterval(() => {
+    loadServerHistory();
+    loadServerStats();
+  }, 10000);
+})();
+</script>
+</body>
+</html>

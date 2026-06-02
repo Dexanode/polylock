@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<title>PolyLock · Terminal Auth</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0d0b14; --border: rgba(189,147,249,.2);
+    --text: #e8d9f5; --dim: #9b87b8; --mute: #5e5275;
+    --btc: #f7931a; --green: #50fa7b; --red: #ff5555;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'JetBrains Mono', monospace;
+    background: #0d0b14; color: var(--text);
+    min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    background: radial-gradient(ellipse 80% 60% at 50% 40%, rgba(247,147,26,.08), transparent 70%), #0d0b14;
+  }
+  .box {
+    width: 360px;
+    background: rgba(18,14,32,.9);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 24px 64px rgba(0,0,0,.7);
+  }
+  .box-header {
+    display: flex; align-items: center; gap: 6px;
+    padding: 10px 14px;
+    background: rgba(30,20,52,.95);
+    border-bottom: 1px solid var(--border);
+    font-size: 11px; color: var(--dim);
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; }
+  .box-body { padding: 28px 24px 24px; }
+  .title { color: var(--btc); font-size: 14px; font-weight: 600; letter-spacing: 1px; margin-bottom: 4px; }
+  .sub { color: var(--mute); font-size: 11px; margin-bottom: 24px; }
+  label { display: block; color: var(--dim); font-size: 10px; letter-spacing: 1.5px; margin-bottom: 6px; }
+  input[type=password] {
+    width: 100%; padding: 10px 12px;
+    background: rgba(255,255,255,.04);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text); font-family: inherit; font-size: 13px;
+    outline: none; transition: border-color .2s;
+    margin-bottom: 16px;
+  }
+  input[type=password]:focus { border-color: rgba(247,147,26,.5); }
+  button {
+    width: 100%; padding: 10px;
+    background: rgba(247,147,26,.15);
+    border: 1px solid rgba(247,147,26,.4);
+    border-radius: 6px;
+    color: var(--btc); font-family: inherit; font-size: 12px;
+    font-weight: 600; letter-spacing: 1px; cursor: pointer;
+    transition: all .2s;
+  }
+  button:hover { background: rgba(247,147,26,.25); }
+  .err { color: var(--red); font-size: 11px; margin-top: 10px; text-align: center; display: none; }
+</style>
+</head>
+<body>
+<div class="box">
+  <div class="box-header">
+    <span class="dot" style="background:#ff6b81"></span>
+    <span class="dot" style="background:#f1fa8c"></span>
+    <span class="dot" style="background:#50fa7b"></span>
+    <span style="margin-left:8px;color:#8be9fd">root@polylock</span>
+    <span style="color:var(--mute)"> ~ $</span>
+    <span style="color:var(--text)"> terminal --auth</span>
+  </div>
+  <div class="box-body">
+    <div class="title">PolyLock Terminal</div>
+    <div class="sub">Enter access token to continue</div>
+    <label>ACCESS TOKEN</label>
+    <input type="password" id="token" placeholder="••••••••••••" autofocus
+           onkeydown="if(event.key==='Enter') login()"/>
+    <button onclick="login()">⌘ CONNECT</button>
+    <div class="err" id="err">❌ Invalid token</div>
+  </div>
+</div>
+<script>
+  function login() {
+    const token = document.getElementById('token').value.trim();
+    if (!token) return;
+    window.location.href = '/terminal/?token=' + encodeURIComponent(token);
+  }
+</script>
+</body>
+</html>
