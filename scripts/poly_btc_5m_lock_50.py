@@ -25,9 +25,10 @@ from enum import Enum
 
 CHECK_INTERVAL       = 5          # seconds between price fetches
 SPREAD_THRESHOLD     = 50         # USD minimum spread to consider a trade
-ALERT_WINDOW_START   = 4 * 60     # 240s — start of LOCK zone
-ALERT_WINDOW_END     = 4 * 60 + 55 # 295s — end of LOCK zone
+ALERT_WINDOW_START   = 3 * 60 + 30  # 210s — start of LOCK zone (lebih awal, beri waktu manual order)
+ALERT_WINDOW_END     = 4 * 60 + 20  # 260s — end of LOCK zone (stop 40s sebelum close)
 FEE_RATE             = 0.02       # Polymarket taker fee
+MIN_ORDER_USDC       = 1.0        # Polymarket minimum order $1
 
 # Signal filters
 MIN_VOLUME_RATIO     = 0.25       # skip if volume < 0.25x 10-candle avg (diturunkan dari 0.5x — spike inflasi avg)
@@ -50,18 +51,24 @@ YAHOO_URL    = "https://query1.finance.yahoo.com/v8/finance/chart/BTC-USD?interv
 CHAINLINK_CONTRACT = "0xc907E116054Ad103354f2D350FD2514433D57F6f"
 CHAINLINK_SELECTOR = "0x50d25bcd"   # latestAnswer()
 POLYGON_RPCS = [
-    "https://1rpc.io/matic",
     "https://polygon.drpc.org",
     "https://rpc-mainnet.matic.quiknode.pro",
+    "https://polygon-bor-rpc.publicnode.com",
+    "https://polygon.llamarpc.com",
 ]
 
 # Binance 5m kline — untuk ambil open price window yang akurat
 KLINES_5M_URL = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=2"
 
+# Polymarket CLOB
+CLOB_HOST  = "https://clob.polymarket.com"
+GAMMA_HOST = "https://gamma-api.polymarket.com"
+
 # Persistent log file — dashboard reads ini, survive restart
 LOG_DIR      = os.path.join(os.path.dirname(__file__), "..", "logs")
 WINDOWS_LOG  = os.path.join(LOG_DIR, "windows.jsonl")
 STATS_LOG    = os.path.join(LOG_DIR, "stats.json")
+CLOB_CREDS_FILE = os.path.join(LOG_DIR, "clob_creds.json")
 
 # ---------------------------------------------------------------------------
 # PERSISTENT LOGGING — dashboard reads from these files
@@ -87,11 +94,12 @@ def log_window(window) -> None:
     with open(WINDOWS_LOG, "a") as f:
         f.write(json.dumps(record) + "\n")
 
-def log_stats(stats, bankroll: float) -> None:
+def log_stats(stats, bankroll: float, mode: str = "paper") -> None:
     """Overwrite stats.json dengan daily stats terkini."""
     _ensure_log_dir()
     record = {
         "date":     stats.date,
+        "mode":     mode,
         "trades":   stats.trades,
         "wins":     stats.wins,
         "losses":   stats.losses,
@@ -102,6 +110,327 @@ def log_stats(stats, bankroll: float) -> None:
     }
     with open(STATS_LOG, "w") as f:
         json.dump(record, f)
+
+# ---------------------------------------------------------------------------
+# LIVE TRADING — CLOB Integration
+# ---------------------------------------------------------------------------
+
+def load_or_create_clob_creds(private_key: str) -> Optional[Dict]:
+    """
+    Load saved CLOB API creds dari file, atau generate baru dari wallet.
+    Creds disimpan supaya tidak perlu generate ulang setiap restart.
+    """
+    _ensure_log_dir()
+
+    # Coba load yang tersimpan
+    if os.path.exists(CLOB_CREDS_FILE):
+        try:
+            with open(CLOB_CREDS_FILE) as f:
+                creds = json.load(f)
+            if all(k in creds for k in ("api_key", "api_secret", "api_passphrase")):
+                print(f"✅ CLOB creds loaded from file")
+                return creds
+        except Exception:
+            pass
+
+    # Generate / derive creds
+    try:
+        _patch_httpx_proxy()
+        from py_clob_client.client import ClobClient
+        from py_clob_client.constants import POLYGON
+
+        client = ClobClient(host=CLOB_HOST, chain_id=POLYGON, key=private_key)
+
+        # Coba derive dulu (jika wallet sudah pernah terdaftar)
+        try:
+            print("🔑 Deriving existing CLOB API credentials...")
+            creds_obj = client.derive_api_key()
+            print(f"✅ Existing CLOB creds derived")
+        except Exception:
+            # Belum ada — buat baru
+            print("🔑 Creating new CLOB API credentials...")
+            creds_obj = client.create_api_key()
+            print(f"✅ New CLOB creds created")
+
+        creds = {
+            "api_key":        creds_obj.api_key,
+            "api_secret":     creds_obj.api_secret,
+            "api_passphrase": creds_obj.api_passphrase,
+        }
+        with open(CLOB_CREDS_FILE, "w") as f:
+            json.dump(creds, f)
+        return creds
+    except Exception as e:
+        print(f"[ERROR] CLOB auth failed: {e}")
+        return None
+
+
+def fetch_polymarket_real_prices(window_start: datetime) -> Tuple[float, float]:
+    """
+    Fetch harga real UP/DOWN dari Polymarket gamma API untuk window saat ini.
+    Returns (up_price, down_price) dalam range 0.0-1.0
+    Returns (0.0, 0.0) jika gagal.
+    """
+    try:
+        ts   = int(window_start.timestamp())
+        slug = f"btc-updown-5m-{ts}"
+        url  = f"{GAMMA_HOST}/markets?slug={slug}"
+        req  = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            markets = json.loads(resp.read())
+        if not markets:
+            return 0.0, 0.0
+        m      = markets[0]
+        prices = json.loads(m.get("outcomePrices", "[0,0]")) if isinstance(m.get("outcomePrices"), str) else m.get("outcomePrices", [0, 0])
+        outcomes = json.loads(m.get("outcomes", '["Up","Down"]')) if isinstance(m.get("outcomes"), str) else m.get("outcomes", ["Up", "Down"])
+        up_idx   = next((i for i, o in enumerate(outcomes) if "up" in str(o).lower()), 0)
+        down_idx = next((i for i, o in enumerate(outcomes) if "down" in str(o).lower()), 1)
+        return float(prices[up_idx]), float(prices[down_idx])
+    except Exception as e:
+        print(f"[WARN] fetch real prices: {e}")
+        return 0.0, 0.0
+
+
+def fetch_btc_5m_market_tokens(window_start: Optional[datetime] = None) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Cari token YES/NO untuk BTC Up/Down 5m market yang sedang aktif.
+
+    Setiap window 5 menit = market tersendiri dengan slug: btc-updown-5m-{timestamp}
+    YES = Up (harga naik), NO = Down (harga turun).
+    Returns (up_token_id, down_token_id).
+    """
+    # Method 1: Fetch by slug dengan timestamp window saat ini
+    if window_start:
+        ts = int(window_start.timestamp())
+        slug = f"btc-updown-5m-{ts}"
+        try:
+            url = f"{GAMMA_HOST}/markets?slug={slug}"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                markets = json.loads(resp.read())
+            if markets:
+                tokens = _parse_tokens_with_outcomes(markets[0])
+                if tokens[0]:
+                    print(f"✅ Market by slug: {markets[0].get('question')}")
+                    return tokens
+        except Exception as e:
+            print(f"[WARN] Slug fetch: {e}")
+
+    # Method 2: Search public-search untuk "Bitcoin Up or Down" aktif terdekat
+    try:
+        from urllib.parse import quote
+        url = f"{GAMMA_HOST}/public-search?q={quote('bitcoin up or down')}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read())
+        now_ts = datetime.now(timezone.utc).timestamp()
+        best_ev = None
+        best_diff = float("inf")
+        for ev in data.get("events", []):
+            slug = ev.get("slug", "")
+            if slug.startswith("btc-updown-5m-"):
+                try:
+                    ev_ts = int(slug.split("-")[-1])
+                    diff = abs(ev_ts - now_ts)
+                    if diff < best_diff:
+                        best_diff = diff
+                        best_ev = ev
+                except Exception:
+                    pass
+        if best_ev:
+            for m in best_ev.get("markets", []):
+                tokens = _parse_tokens_with_outcomes(m)
+                if tokens[0]:
+                    print(f"✅ Market found (Δ{best_diff:.0f}s): {best_ev.get('title')}")
+                    return tokens
+    except Exception as e:
+        print(f"[WARN] Market search: {e}")
+
+    print("[WARN] BTC 5m market not found — market mungkin belum dibuka")
+    return None, None
+
+
+def _parse_tokens_with_outcomes(market: dict) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Parse token IDs dan map ke UP/DOWN direction.
+    Polymarket BTC Up/Down: outcome 'Up' = UP token, 'Down' = DOWN token.
+    """
+    try:
+        raw      = market.get("clobTokenIds", "[]")
+        outcomes_raw = market.get("outcomes", '["Up","Down"]')
+        ids      = json.loads(raw)      if isinstance(raw, str)          else raw
+        outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+
+        if len(ids) < 2:
+            return None, None
+
+        # Cari index Up dan Down
+        up_idx   = next((i for i, o in enumerate(outcomes) if "up" in str(o).lower()), 0)
+        down_idx = next((i for i, o in enumerate(outcomes) if "down" in str(o).lower()), 1)
+
+        return ids[up_idx], ids[down_idx]
+    except Exception:
+        return None, None
+
+
+def _parse_tokens(market: dict) -> Optional[Tuple[str, str]]:
+    """Parse clobTokenIds dari market object."""
+    try:
+        raw = market.get("clobTokenIds", "[]")
+        ids = json.loads(raw) if isinstance(raw, str) else raw
+        if len(ids) >= 2:
+            return ids[0], ids[1]
+    except Exception:
+        pass
+    return None
+
+
+class _RequestsProxyClient:
+    """
+    Drop-in replacement untuk httpx.Client yang pakai `requests` library.
+    requests handle proxy auth untuk HTTPS CONNECT jauh lebih reliable
+    daripada httpx/httpcore yang punya bug untuk beberapa proxy provider.
+    """
+    def __init__(self, proxy_url: str):
+        import requests as _req
+        self._session = _req.Session()
+        self._session.proxies = {"http": proxy_url, "https": proxy_url}
+        self._session.verify = True
+
+    def request(self, method: str, url: str, headers=None, content=None, json=None, **kw):
+        import requests as _req
+        import httpx as _httpx
+        try:
+            resp = self._session.request(
+                method=method, url=url,
+                headers=headers,
+                data=content,
+                json=json,
+            )
+            return _FakeHttpxResp(resp)
+        except _req.exceptions.RequestException as e:
+            raise _httpx.RequestError(str(e)) from e
+
+    def close(self):
+        try:
+            self._session.close()
+        except Exception:
+            pass
+
+
+class _FakeHttpxResp:
+    """Minimal httpx.Response shim agar py_clob_client bisa baca status_code + json."""
+    def __init__(self, resp):
+        self.status_code = resp.status_code
+        self._resp = resp
+
+    def json(self):
+        return self._resp.json()
+
+    @property
+    def text(self):
+        return self._resp.text
+
+
+def _patch_httpx_proxy():
+    """
+    Ganti module-level _http_client singleton di py_clob_client dengan
+    _RequestsProxyClient yang pakai requests library.
+
+    py_clob_client membuat httpx.Client(http2=True) saat module di-import.
+    requests handle proxy auth HTTPS CONNECT lebih reliable dari httpx.
+    """
+    proxy_url = (
+        os.environ.get("HTTPS_PROXY") or
+        os.environ.get("https_proxy") or
+        os.environ.get("HTTP_PROXY") or
+        os.environ.get("http_proxy", "")
+    )
+    if not proxy_url:
+        return
+    try:
+        import py_clob_client.http_helpers.helpers as _helpers
+
+        if getattr(_helpers, "_proxy_patched", False):
+            return
+
+        try:
+            _helpers._http_client.close()
+        except Exception:
+            pass
+
+        _helpers._http_client = _RequestsProxyClient(proxy_url)
+        _helpers._proxy_patched = True
+        print(f"[PROXY] using requests proxy → {proxy_url.split('@')[-1]}")
+    except Exception as e:
+        print(f"[WARN] proxy patch failed: {e}")
+
+
+def place_live_order(
+    private_key: str,
+    creds: Dict,
+    token_id: str,
+    size_usdc: float,
+    price: float,
+) -> bool:
+    """
+    Place BUY order di Polymarket CLOB.
+    size_usdc = jumlah USDC yang mau diinvest
+    price     = harga per share (0.01–0.99)
+    Returns True jika order berhasil.
+    """
+    try:
+        # Patch httpx dulu agar proxy dipakai oleh py_clob_client
+        _patch_httpx_proxy()
+
+        from py_clob_client.client import ClobClient
+        from py_clob_client.constants import POLYGON
+        from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
+        from py_clob_client.order_builder.constants import BUY
+
+        api_creds = ApiCreds(
+            api_key=creds["api_key"],
+            api_secret=creds["api_secret"],
+            api_passphrase=creds["api_passphrase"],
+        )
+        client = ClobClient(
+            host=CLOB_HOST, chain_id=POLYGON,
+            key=private_key, creds=api_creds,
+        )
+
+        # Shares = USDC / price_per_share
+        shares = round(size_usdc / price, 2)
+        if shares < 0.1:
+            print(f"[WARN] Size too small: {shares} shares (min 0.1)")
+            return False
+
+        order_args = OrderArgs(
+            token_id=token_id,
+            price=price,
+            size=shares,
+            side=BUY,
+        )
+
+        print(f"[LIVE] Signing order: {shares} shares @ {price} (${size_usdc:.2f} USDC)...")
+        signed_order = client.create_order(order_args)
+        resp = client.post_order(signed_order, OrderType.GTC)
+
+        print(f"[LIVE] Order response: {resp}")
+
+        if resp and (resp.get("success") or resp.get("orderID") or resp.get("id")):
+            order_id = resp.get("orderID") or resp.get("id", "?")
+            print(f"✅ Order placed! ID: {order_id}")
+            return True
+        else:
+            err = resp.get("errorMsg") or resp.get("error") or str(resp) if resp else "no response"
+            print(f"[ERROR] Order rejected: {err}")
+            return False
+
+    except Exception as e:
+        print(f"[ERROR] Order placement: {e}")
+        import traceback; traceback.print_exc()
+        return False
+
 
 # ---------------------------------------------------------------------------
 # ENUMS & DATACLASSES
@@ -170,26 +499,14 @@ def fetch_btc_yahoo() -> float:
 
 def fetch_window_open_price() -> Tuple[float, datetime]:
     """
-    Ambil open price dari 5m candle yang sedang berjalan di Binance.
-    Ini adalah PTB yang benar — harga tepat saat window buka.
-    Dipakai saat bot start/restart di tengah window supaya PTB tidak meleset.
-    Returns (open_price, candle_open_time) atau (0.0, None) jika gagal.
+    Ambil harga BTC via Chainlink — feed yang sama dengan Polymarket.
+    Dipakai saat bot restart di tengah window supaya PTB akurat.
+    Returns (price, now_utc) atau (0.0, None) jika gagal.
     """
-    try:
-        req = urllib.request.Request(KLINES_5M_URL, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            data = json.loads(resp.read())
-        if not data:
-            return 0.0, None
-        # data[-1] = candle 5m yang sedang berjalan
-        # data[-1][0] = open time (ms), data[-1][1] = open price
-        candle = data[-1]
-        open_time  = datetime.fromtimestamp(candle[0] / 1000, tz=timezone.utc)
-        open_price = float(candle[1])
-        return open_price, open_time
-    except Exception as e:
-        print(f"[WARN] 5m candle open: {e}")
-        return 0.0, None
+    price = fetch_btc_chainlink()
+    if price > 0:
+        return price, datetime.now(timezone.utc)
+    return 0.0, None
 
 
 def fetch_btc_chainlink() -> float:
@@ -284,7 +601,7 @@ def fetch_btc_binance_signal() -> Dict:
 def send_telegram(msg: str, token: str, chat_id: str):
     try:
         url     = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload = json.dumps({"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"}).encode()
+        payload = json.dumps({"chat_id": chat_id, "text": msg, "parse_mode": "HTML"}).encode()
         req     = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=5)
     except Exception as e:
@@ -336,6 +653,9 @@ def get_position_size(bankroll: float, entry_price: float) -> float:
     max_cost = size * entry_price
     if max_cost > bankroll * 0.85:
         size = (bankroll * 0.85) / entry_price
+    # Enforce minimum $1 order
+    min_shares = MIN_ORDER_USDC / entry_price
+    size = max(size, min_shares)
     return round(size, 2)
 
 
@@ -359,8 +679,8 @@ def format_time(dt: datetime) -> str:
 class AutoTrader:
     def __init__(self, args):
         self.mode               = Mode.LIVE if getattr(args, 'live', False) else Mode.PAPER
-        self.telegram_token     = args.telegram_token or ""
-        self.chat_id            = args.chat_id or ""
+        self.telegram_token     = args.telegram_token or os.environ.get("TELEGRAM_TOKEN", "")
+        self.chat_id            = args.chat_id or os.environ.get("TELEGRAM_CHAT_ID", "")
         self.spread_threshold   = args.spread
         self.bankroll           = args.bankroll
         self.initial_bankroll   = args.bankroll
@@ -375,28 +695,60 @@ class AutoTrader:
         self.all_time_trades: List[WindowState] = []
 
         # FIX 1: price history untuk resolve akurat di boundary window
-        # deque of (datetime, float) — rolling 5 menit
         self.price_history: deque = deque(maxlen=PRICE_HISTORY_SIZE)
+
+        # Live trading state
+        self.clob_creds: Optional[Dict]  = None
+        self.yes_token:  Optional[str]   = None   # UP token
+        self.no_token:   Optional[str]   = None   # DOWN token
+        self._private_key = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
+
+        # Init CLOB jika live mode
+        if self.mode == Mode.LIVE:
+            self._init_live()
 
         self._print_banner()
 
     # ── BANNER ─────────────────────────────────────────────────────────────
 
     def _print_banner(self):
+        mode_label = "🔴 LIVE — REAL MONEY" if self.mode == Mode.LIVE else "📄 PAPER — no real money"
+        # Tulis mode ke stats.json saat startup
+        log_stats(self.daily_stats, self.bankroll, self.mode.value)
         self._notify(f"""
 {'='*55}
-  🔐 POLYMARKET BTC 5m LOCK BOT — $50 THRESHOLD
+  ₿ POLYMARKET BTC 5m LOCK BOT — $50 THRESHOLD
 {'='*55}
   Mode:           {self.mode.value.upper()}
   Bankroll:       ${self.bankroll:.2f}
   Spread Target:  ${self.spread_threshold}
   Daily Stop:     ${self.daily_stop}
-  Max Trades/Day: {self.max_trades_per_day}
   Telegram:       {'ENABLED' if self.telegram_token else 'OFF'}
 {'='*55}
-  Fixes: boundary-resolve · slippage · 3c-momentum · re-entry
+  ⚠️  {mode_label}
 {'='*55}
 """)
+
+    # ── LIVE INIT ──────────────────────────────────────────────────────────
+
+    def _init_live(self):
+        """Setup CLOB credentials dan fetch market tokens untuk live trading."""
+        if not self._private_key:
+            print("❌ POLYMARKET_PRIVATE_KEY not set! Falling back to PAPER.")
+            self.mode = Mode.PAPER
+            return
+
+        print("🔐 Initializing live trading...")
+
+        # 1. CLOB credentials
+        self.clob_creds = load_or_create_clob_creds(self._private_key)
+        if not self.clob_creds:
+            print("⚠️  CLOB auth failed — falling back to PAPER mode")
+            self.mode = Mode.PAPER
+            return
+
+        # 2. Market tokens — akan di-fetch ulang per window saat LOCK trigger
+        print("✅ Live ready! Tokens akan di-fetch per window saat LOCK.")
 
     # ── NOTIFY ─────────────────────────────────────────────────────────────
 
@@ -479,7 +831,7 @@ class AutoTrader:
 
     # ── EXECUTE ────────────────────────────────────────────────────────────
 
-    def _execute_trade(self, direction: Direction, window: WindowState, entry_price: float, size: float) -> bool:
+    def _execute_trade(self, direction: Direction, window: WindowState, entry_price: float, size: float, abs_spread: float = 0.0) -> bool:
         cost       = size * entry_price
         fee        = cost * FEE_RATE
         total_cost = cost + fee
@@ -488,10 +840,75 @@ class AutoTrader:
             print(f"[WARN] Insufficient funds: need ${total_cost:.2f}, have ${self.bankroll:.2f}")
             return False
 
-        print(f"\n{'='*50}")
-        print(f"[{'LIVE' if self.mode == Mode.LIVE else 'PAPER'} TRADE] BUY {size} shares @ {entry_price:.2f}")
-        print(f"  Direction: {direction.value} | Cost: ${total_cost:.2f} | Fee: ${fee:.2f}")
-        print(f"{'='*50}\n")
+        # ── SIGNAL NOTIFY ──────────────────────────────────────────────────
+        if self.mode == Mode.LIVE:
+            spread = abs_spread or abs(window.final_spread or 0)
+
+            # Fetch harga REAL dari Polymarket sebelum kirim sinyal
+            up_price, down_price = fetch_polymarket_real_prices(window.start)
+            real_price = up_price if direction == Direction.UP else down_price
+            print(f"[PRICE CHECK] UP={up_price:.2f} DOWN={down_price:.2f} | Signal={direction.value}")
+
+            # Validasi: harga real harus match direction
+            # Kalau signal UP tapi UP sudah >0.85 = market terlalu mahal, skip
+            # Kalau signal DOWN tapi DOWN sudah <0.30 = market pricing DOWN unlikely, skip
+            MIN_PRICE = 0.30   # harga terlalu murah = market tidak percaya direction ini
+            MAX_PRICE = 0.97   # harga terlalu mahal = profit terlalu kecil
+            if real_price > 0:
+                if real_price < MIN_PRICE:
+                    msg_skip = (
+                        f"⚠️ <b>SIGNAL SKIPPED</b>\n"
+                        f"Direction {direction.value} tapi harga real hanya <code>{real_price:.2f}</code> ({int(real_price*100)}¢)\n"
+                        f"Market tidak confident → skip untuk hindari loss"
+                    )
+                    print(f"[SKIP] {direction.value} price too low: {real_price:.2f}")
+                    if self.telegram_token and self.chat_id:
+                        send_telegram(msg_skip, self.telegram_token, self.chat_id)
+                    return False
+                if real_price > MAX_PRICE:
+                    print(f"[SKIP] {direction.value} price too high (no profit): {real_price:.2f}")
+                    return False
+
+            # Pakai harga real jika tersedia, fallback ke estimasi
+            actual_price = real_price if real_price > 0 else entry_price
+            bet_usdc     = max(cost, MIN_ORDER_USDC)
+            profit_est   = round(bet_usdc / actual_price * (1 - FEE_RATE) - bet_usdc, 2)
+            win_prob     = estimate_win_probability(abs(spread))
+            emoji        = "🟢" if direction == Direction.UP else "🔴"
+            action       = "BUY YES" if direction == Direction.UP else "BUY NO"
+            ts           = int(window.start.timestamp())
+            slug         = f"btc-updown-5m-{ts}"
+            market_url   = f"https://polymarket.com/event/{slug}"
+
+            # Warning kalau harga agak rendah (30-45¢)
+            price_warn = " ⚠️ harga rendah, pertimbangkan skip" if real_price < 0.45 else ""
+
+            msg = (
+                f"{emoji} <b>LOCK SIGNAL — BTC 5m</b>\n"
+                f"Action    : <b>{action}</b>\n"
+                f"─────────────────\n"
+                f"Harga Real : <code>{actual_price:.2f}</code> ({int(actual_price*100)}¢){price_warn}\n"
+                f"Bet        : <code>${bet_usdc:.2f} USDC</code>\n"
+                f"Est. Profit: <code>+${profit_est:.2f}</code> jika menang\n"
+                f"Win Prob   : <code>{int(win_prob*100)}%</code>\n"
+                f"Spread     : <code>${spread:.0f}</code>\n"
+                f"Window     : <code>{format_time(window.start)}</code>\n"
+                f"─────────────────\n"
+                f"<a href=\"{market_url}\">🔗 Buka Market</a>"
+            )
+            print(f"\n{'='*50}")
+            print(f"[SIGNAL] {direction.value} | real price {actual_price:.2f} | spread ${spread:.0f}")
+            print(f"{'='*50}")
+            if self.telegram_token and self.chat_id:
+                send_telegram(msg, self.telegram_token, self.chat_id)
+                print("[TELEGRAM] Notif terkirim ✅")
+
+        # ── PAPER / Record ─────────────────────────────────────────────────
+        else:
+            print(f"\n{'='*50}")
+            print(f"[PAPER TRADE] BUY {size} shares @ {entry_price:.2f}")
+            print(f"  Direction: {direction.value} | Cost: ${total_cost:.2f} | Fee: ${fee:.2f}")
+            print(f"{'='*50}\n")
 
         window.traded      = True
         window.direction   = direction
@@ -500,10 +917,9 @@ class AutoTrader:
         self.daily_stats.trades += 1
         self.bankroll -= total_cost
         print(f"[TRADE] Bankroll: ${self.bankroll:.2f}")
-        # Log window sebagai PENDING dulu, akan di-update saat resolve
         window.result = "PENDING"
         log_window(window)
-        log_stats(self.daily_stats, self.bankroll)
+        log_stats(self.daily_stats, self.bankroll, self.mode.value)
         return True
 
     # ── FIX 1: RESOLVE WITH BOUNDARY PRICE ─────────────────────────────────
@@ -570,7 +986,7 @@ class AutoTrader:
         self._notify(msg)
         # Persist hasil final ke file — overwrite baris PENDING
         log_window(window)
-        log_stats(self.daily_stats, self.bankroll)
+        log_stats(self.daily_stats, self.bankroll, self.mode.value)
 
     # ── MAIN LOOP ──────────────────────────────────────────────────────────
 
@@ -611,17 +1027,14 @@ class AutoTrader:
                     self._resolve_window(self.current_window, btc_price)
                     self.all_time_trades.append(self.current_window)
 
-                # FIX PTB: kalau bot start/restart di tengah window (seconds_into > 5),
-                # ambil open price 5m candle dari Binance agar PTB = harga saat :00
-                # bukan harga saat bot nyala (yang bisa beda $50+)
                 ptb = btc_price
                 if seconds_into > 5:
-                    open_price, open_time = fetch_window_open_price()
-                    if open_price > 0 and open_time and abs((open_time - window_start).total_seconds()) < 30:
-                        ptb = open_price
-                        print(f"\n🌅 New window: {format_time(window_start)} | PTB: ${ptb:,.2f} (from 5m open, bot joined +{int(seconds_into)}s late)")
-                    else:
-                        print(f"\n🌅 New window: {format_time(window_start)} | PTB: ${ptb:,.2f} (current price, 5m open unavailable)")
+                    # Bot restart di tengah window — PTB tidak bisa diambil dari harga sekarang
+                    # Pakai Chainlink (feed Polymarket) sebagai best-effort, tandai sebagai estimasi
+                    cl_price, _ = fetch_window_open_price()
+                    if cl_price > 0:
+                        ptb = cl_price
+                    print(f"\n🌅 New window: {format_time(window_start)} | PTB: ${ptb:,.2f} (chainlink est., bot joined +{int(seconds_into)}s late)")
                 else:
                     print(f"\n🌅 New window: {format_time(window_start)} | PTB: ${ptb:,.2f}")
 
@@ -680,9 +1093,10 @@ class AutoTrader:
                         f"Mode: *{self.mode.value.upper()}*"
                     )
                     self._notify(alert_msg)
+                    w.alerted = True  # set sekarang — cegah spam re-trigger tiap 5s
 
-                    if size > 0 and self._execute_trade(direction, w, entry_price, size):
-                        w.alerted = True  # FIX 4: set alerted hanya setelah trade berhasil
+                    if size > 0:
+                        self._execute_trade(direction, w, entry_price, size, abs_spread)
 
             time.sleep(CHECK_INTERVAL)
 
