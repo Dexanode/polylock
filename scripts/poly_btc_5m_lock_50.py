@@ -1720,8 +1720,9 @@ class AutoTrader:
             spread     = btc_price - w.ptb
             abs_spread = abs(spread)
             direction  = Direction.UP if spread > 0 else Direction.DOWN
-            # FIX: selalu update direction di window state — tampil di log meski SKIP
-            w.direction = direction
+            # Only update direction if not yet traded — preserve direction after execution
+            if not w.traded:
+                w.direction = direction
 
             # Log every minute
             if int(seconds_into) % 60 == 0:
