@@ -495,21 +495,41 @@ def check_order_fill(client, order_id: str) -> Optional[float]:
         return None
 
 
-def check_liquidity(client, token_id: str) -> bool:
-    """Check if token has an active order book with sell orders.
-    Returns True if there's at least one ask (can buy), False if empty."""
+def check_liquidity(client, token_id: str, min_size_usdc: float = 3.0) -> Tuple[bool, float]:
+    """Check if token has enough liquidity to fill min_size_usdc.
+    Returns (has_liquidity, best_ask_price)."""
     try:
         book = client.get_order_book(token_id)
         if not isinstance(book, dict):
-            return False
+            return False, 0.0
         asks = book.get("asks", [])
-        return len(asks) > 0
+        if not asks:
+            return False, 0.0
+        
+        # Calculate total USDC capacity from asks (cumulative until min_size_usdc met)
+        total_capacity = 0.0
+        best_ask = 0.0
+        for ask in asks:
+            try:
+                price = float(ask.get("price", 0))
+                size = float(ask.get("size", 0))
+                if best_ask == 0.0 and price > 0:
+                    best_ask = price
+                total_capacity += price * size
+                if total_capacity >= min_size_usdc:
+                    return True, best_ask
+            except (ValueError, TypeError):
+                continue
+        
+        # Not enough cumulative liquidity
+        print(f"[LIQUIDITY] Total ask depth: ${total_capacity:.2f} (need ${min_size_usdc:.2f})")
+        return False, best_ask
     except Exception as e:
         err = str(e)
         if "404" in err or "No orderbook" in err:
-            return False  # No order book at all
+            return False, 0.0
         print(f"[LIQUIDITY] Check error: {err[:100]}")
-        return False  # Assume no liquidity on error
+        return False, 0.0
 
 
 def place_live_order(
@@ -548,9 +568,14 @@ def place_live_order(
 
         print(f"[MARKET ORDER] ${size_usdc:.2f} USDC → {token_id[:15]}...")
         
-        # Pre-check: skip if no order book (zero liquidity)
-        if not check_liquidity(client, token_id):
-            return {"success": False, "error": "Zero liquidity — no order book for this market"}
+        # Pre-check: skip if not enough liquidity to fill size_usdc
+        has_liq, best_ask = check_liquidity(client, token_id, min_size_usdc=size_usdc)
+        if not has_liq:
+            return {"success": False, "error": f"Thin orderbook — not enough asks for ${size_usdc:.2f} (best ask: {best_ask:.2f})"}
+        
+        # Sanity check: best ask shouldn't be way off our expected price
+        if best_ask > 0 and abs(best_ask - price) > 0.10:
+            print(f"[WARN] Best ask {best_ask:.2f} ≠ signal price {price:.2f} (drift {abs(best_ask-price):.2f})")
         
         order_args = MarketOrderArgsV2(
             token_id=token_id,
@@ -999,18 +1024,206 @@ class AutoTrader:
         if self.telegram_token and self.chat_id:
             send_telegram(msg, self.telegram_token, self.chat_id)
 
+    # ── TELEGRAM COMMAND HANDLER ─────────────────────────────────
+    def _poll_telegram_commands(self):
+        """Poll Telegram for new commands every cycle."""
+        if not self.telegram_token or not self.chat_id:
+            return
+        if not hasattr(self, '_tg_last_update'):
+            self._tg_last_update = 0
+        try:
+            url = f"https://api.telegram.org/bot{self.telegram_token}/getUpdates"
+            params = f"?offset={self._tg_last_update + 1}&timeout=1"
+            req = urllib.request.Request(url + params)
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                data = json.loads(resp.read())
+            
+            for update in data.get("result", []):
+                self._tg_last_update = max(self._tg_last_update, update["update_id"])
+                msg = update.get("message", {})
+                text = msg.get("text", "").strip().lower()
+                from_id = str(msg.get("from", {}).get("id", ""))
+                
+                # Only respond to authorized chat
+                if from_id != str(self.chat_id):
+                    continue
+                
+                if text.startswith("/"):
+                    self._handle_command(text)
+        except Exception as e:
+            pass  # silent fail, retry next cycle
+
+    def _handle_command(self, cmd: str):
+        """Handle Telegram commands."""
+        cmd = cmd.lstrip("/").split("@")[0].split()[0] if cmd else ""
+        
+        if cmd in ("status", "start"):
+            wr = self.daily_stats.wins * 100 / max(1, self.daily_stats.trades)
+            uptime = (datetime.now(timezone.utc) - self._start_time).total_seconds() / 3600 if hasattr(self, '_start_time') else 0
+            self._notify(
+                f"🤖 <b>BOT STATUS</b>\n"
+                f"Mode: <code>{self.mode.value}</code>\n"
+                f"Uptime: <code>{uptime:.1f}h</code>\n"
+                f"Bankroll: <code>${self.bankroll:.2f}</code>\n"
+                f"Today Trades: <code>{self.daily_stats.trades}</code>\n"
+                f"W/L: <code>{self.daily_stats.wins}/{self.daily_stats.losses}</code> ({wr:.0f}%)\n"
+                f"P/L: <code>${self.daily_stats.profit:+.2f}</code>\n"
+                f"Filter: spread≥<code>{self.spread_threshold}</code>, price <code>0.40-0.80</code>"
+            )
+        
+        elif cmd == "pnl":
+            # Calculate PnL stats from all_time_trades
+            resolved = [t for t in self.all_time_trades if t.result in ("WIN", "LOSS")]
+            wins = [t for t in resolved if t.result == "WIN"]
+            losses = [t for t in resolved if t.result == "LOSS"]
+            total_pnl = sum(getattr(t, 'profit', 0) or 0 for t in resolved)
+            wr = len(wins) * 100 / max(1, len(resolved))
+            
+            # Direction breakdown
+            up_trades = [t for t in resolved if t.direction == Direction.UP]
+            down_trades = [t for t in resolved if t.direction == Direction.DOWN]
+            up_wr = sum(1 for t in up_trades if t.result=="WIN") * 100 / max(1, len(up_trades))
+            down_wr = sum(1 for t in down_trades if t.result=="WIN") * 100 / max(1, len(down_trades))
+            
+            self._notify(
+                f"💰 <b>PnL REPORT</b>\n"
+                f"Bankroll: <code>${self.bankroll:.2f}</code>\n"
+                f"Total Trades: <code>{len(resolved)}</code>\n"
+                f"Wins: <code>{len(wins)}</code> | Losses: <code>{len(losses)}</code>\n"
+                f"Win Rate: <code>{wr:.0f}%</code>\n"
+                f"Total P/L: <code>${total_pnl:+.2f}</code>\n\n"
+                f"📊 <b>By Direction:</b>\n"
+                f"⬆️ UP: <code>{len(up_trades)}</code> trades ({up_wr:.0f}% WR)\n"
+                f"⬇️ DOWN: <code>{len(down_trades)}</code> trades ({down_wr:.0f}% WR)\n\n"
+                f"<b>Today:</b> <code>{self.daily_stats.trades}</code> trades, <code>${self.daily_stats.profit:+.2f}</code>"
+            )
+        
+        elif cmd == "positions":
+            pending = self._pending_live if hasattr(self, '_pending_live') else []
+            current = self.current_window
+            
+            msg = f"📌 <b>POSITIONS</b>\n\n"
+            
+            if current and current.traded:
+                spread = current.final_spread or 0
+                msg += (
+                    f"<b>Active:</b>\n"
+                    f"  {current.start.strftime('%H:%M')} {current.direction.value}\n"
+                    f"  Entry: ${current.entry_price:.2f} x {current.size} shares\n"
+                    f"  Spread: {spread:+.2f}\n\n"
+                )
+            
+            if pending:
+                msg += f"<b>Pending ({len(pending)}):</b>\n"
+                for pw in pending[-5:]:
+                    msg += f"  {pw.start.strftime('%H:%M')} {pw.direction.value} @ ${pw.entry_price:.2f}\n"
+            elif not (current and current.traded):
+                msg += "<i>No active positions</i>\n"
+            
+            self._notify(msg)
+        
+        elif cmd == "balance":
+            from_clob = None
+            if self.mode == Mode.LIVE and self.clob_creds:
+                try:
+                    from_clob = fetch_polymarket_balance(self._private_key, self.clob_creds)
+                except: pass
+            
+            msg = f"💵 <b>BALANCE</b>\nBot: <code>${self.bankroll:.2f}</code>"
+            if from_clob is not None:
+                drift = from_clob - self.bankroll
+                msg += f"\nReal: <code>${from_clob:.2f}</code>\nDrift: <code>{drift:+.2f}</code>"
+            self._notify(msg)
+        
+        elif cmd == "trades":
+            resolved = [t for t in self.all_time_trades if t.result in ("WIN", "LOSS")]
+            last_n = resolved[-10:]
+            
+            msg = f"📜 <b>LAST {len(last_n)} TRADES</b>\n\n"
+            for t in last_n:
+                emoji = "✅" if t.result == "WIN" else "❌"
+                profit = getattr(t, 'profit', 0) or 0
+                msg += f"{emoji} {t.start.strftime('%H:%M')} {t.direction.value} @ ${t.entry_price:.2f} | {profit:+.2f}\n"
+            
+            self._notify(msg or "No trades yet")
+        
+        elif cmd == "pause":
+            self._manual_pause = True
+            self._notify("⏸️ <b>BOT PAUSED</b>\nUse /resume to continue trading")
+        
+        elif cmd == "resume":
+            self._manual_pause = False
+            self._notify("▶️ <b>BOT RESUMED</b>")
+        
+        elif cmd == "help":
+            self._notify(
+                "📖 <b>COMMANDS</b>\n"
+                "/status - Bot health & today stats\n"
+                "/pnl - Full PnL breakdown\n"
+                "/positions - Active & pending trades\n"
+                "/balance - Bot vs real balance\n"
+                "/trades - Last 10 trades\n"
+                "/pause - Stop trading\n"
+                "/resume - Resume trading\n"
+                "/help - This menu"
+            )
+
+    def _send_hourly_report(self):
+        """Send auto report every hour."""
+        now = datetime.now(timezone.utc)
+        if not hasattr(self, '_last_hourly_report'):
+            self._last_hourly_report = now
+            return
+        
+        # Check if 1 hour passed
+        elapsed = (now - self._last_hourly_report).total_seconds()
+        if elapsed < 3600:
+            return
+        
+        self._last_hourly_report = now
+        
+        wr = self.daily_stats.wins * 100 / max(1, self.daily_stats.trades)
+        recent = self._recent_results[-5:] if hasattr(self, '_recent_results') else []
+        recent_str = " ".join(["✅" if r=="WIN" else "❌" for r in recent]) or "none"
+        
+        self._notify(
+            f"⏰ <b>HOURLY REPORT</b>\n"
+            f"Bankroll: <code>${self.bankroll:.2f}</code>\n"
+            f"Today: <code>{self.daily_stats.trades}</code> trades, "
+            f"<code>{self.daily_stats.wins}W/{self.daily_stats.losses}L</code> ({wr:.0f}%)\n"
+            f"P/L: <code>${self.daily_stats.profit:+.2f}</code>\n"
+            f"Last 5: {recent_str}"
+        )
+
     # ── DAILY RESET ────────────────────────────────────────────────────────
 
     def _check_new_day(self):
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if today != self.daily_stats.date:
+            wr = self.daily_stats.wins*100/max(1,self.daily_stats.trades)
             summary = (
-                f"📅 Day summary: {self.daily_stats.date}\n"
-                f"   Trades: {self.daily_stats.trades} | W/L: {self.daily_stats.wins}/{self.daily_stats.losses}\n"
-                f"   P/L: ${self.daily_stats.profit:+.2f} | Peak: ${self.daily_stats.peak_bankroll:.2f}"
+                f"📅 *Day Summary:* {self.daily_stats.date}\n"
+                f"   Trades: `{self.daily_stats.trades}` | W/L: `{self.daily_stats.wins}/{self.daily_stats.losses}`\n"
+                f"   Win Rate: `{wr:.0f}%`\n"
+                f"   P/L: `${self.daily_stats.profit:+.2f}` | Peak: `${self.daily_stats.peak_bankroll:.2f}`"
             )
             self._notify(summary)
             self.daily_stats = DailyStats(date=today, peak_bankroll=self.bankroll)
+
+    def _check_anomaly(self):
+        """Alert if 3 losses in row, pause if 5."""
+        if not hasattr(self, '_recent_results'):
+            self._recent_results = []
+        # Keep last 5
+        self._recent_results = self._recent_results[-5:]
+        
+        if len(self._recent_results) >= 3 and all(r == 'LOSS' for r in self._recent_results[-3:]):
+            self._notify(f"⚠️ <b>3 LOSSES IN ROW</b>\nBankroll: ${self.bankroll:.2f}\nConsider review or adjustment.")
+        
+        if len(self._recent_results) >= 5 and all(r == 'LOSS' for r in self._recent_results[-5:]):
+            self._notify(f"🚨 <b>5 LOSSES IN ROW — AUTO PAUSE</b>\nBankroll: ${self.bankroll:.2f}")
+            return True
+        return False
 
     # ── RISK CONTROLS ──────────────────────────────────────────────────────
 
@@ -1018,6 +1231,9 @@ class AutoTrader:
         if self.daily_stats.profit <= -self.daily_stop:
             return True
         if self.bankroll < 1.0:
+            return True
+        # Check anomaly (3+ losses in row)
+        if self._check_anomaly():
             return True
         return False
 
@@ -1055,6 +1271,16 @@ class AutoTrader:
 
         if vol_ratio < MIN_VOLUME_RATIO:
             return False, f"LOW_VOLUME ({vol_ratio:.2f}x)"
+
+        # ── ANTI-TREND FILTER (avoid betting against established trend) ──
+        # If momentum > 0.05 and bot wants UP → OK (with trend)
+        # If momentum > 0.05 and bot wants DOWN → BLOCK (counter-trend)
+        # Same for opposite
+        if direction == Direction.UP and momentum < -0.05:
+            return False, f"COUNTER_TREND (BTC dropping {momentum:.4f}%, but UP signal)"
+
+        if direction == Direction.DOWN and momentum > 0.05:
+            return False, f"COUNTER_TREND (BTC rising +{momentum:.4f}%, but DOWN signal)"
 
         if direction == Direction.DOWN and momentum > MOMENTUM_THRESHOLD:
             return False, f"COUNTER_MOMENTUM_UP (+{momentum:.4f}%)"
@@ -1094,8 +1320,8 @@ class AutoTrader:
             # Validasi: harga real harus match direction
             # Kalau signal UP tapi UP sudah >0.85 = market terlalu mahal, skip
             # Kalau signal DOWN tapi DOWN sudah <0.30 = market pricing DOWN unlikely, skip
-            MIN_PRICE = 0.30   # harga terlalu murah = market tidak percaya direction ini
-            MAX_PRICE = 0.85   # di atas ini profit terlalu tipis + zero liquidity risk
+            MIN_PRICE = 0.40   # harga terlalu murah = market tidak percaya direction ini (was 0.30)
+            MAX_PRICE = 0.80   # di atas ini profit terlalu tipis (was 0.85)
             if real_price > 0:
                 if real_price < MIN_PRICE:
                     msg_skip = (
@@ -1316,10 +1542,13 @@ class AutoTrader:
         if won:
             payout = window.size * 1.0
             profit = payout - total_cost
+            window.profit = profit  # ← UPDATE LOG
             self.daily_stats.wins   += 1
             self.daily_stats.profit += profit
             self.bankroll           += payout
             window.result = "WIN"
+            if hasattr(self, '_recent_results'): self._recent_results.append('WIN')
+            else: self._recent_results = ['WIN']
             source_tag = "[Polymarket]" if window._is_live else ""
             msg = (
                 f"✅ *LOCK WIN* 🎉 {source_tag}\n"
@@ -1330,9 +1559,12 @@ class AutoTrader:
             )
         else:
             loss = total_cost
+            window.profit = -loss  # ← UPDATE LOG
             self.daily_stats.losses += 1
             self.daily_stats.profit -= loss
             window.result = "LOSS"
+            if hasattr(self, '_recent_results'): self._recent_results.append('LOSS')
+            else: self._recent_results = ['LOSS']
             source_tag = "[Polymarket]" if window._is_live else ""
             msg = (
                 f"❌ *LOCK LOSS* {source_tag}\n"
@@ -1372,10 +1604,19 @@ class AutoTrader:
 
     def run(self):
         print("💡 PolyLock Bot running. Press Ctrl+C to stop.\n")
+        self._start_time = datetime.now(timezone.utc)
+        self._notify("🤖 <b>Bot ONLINE</b>\nType /help for commands")
 
         while True:
             now = datetime.now(timezone.utc)
             self._check_new_day()
+            self._poll_telegram_commands()
+            self._send_hourly_report()
+
+            # Manual pause check
+            if getattr(self, '_manual_pause', False):
+                time.sleep(10)
+                continue
 
             if self._should_stop_trading():
                 if not getattr(self, '_stopped_notified', False):
