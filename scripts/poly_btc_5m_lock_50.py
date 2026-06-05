@@ -1085,6 +1085,13 @@ class AutoTrader:
                         send_telegram(msg_skip, self.telegram_token, self.chat_id)
                     return False
                 if real_price > MAX_PRICE:
+                    if self.telegram_token and self.chat_id:
+                        send_telegram(
+                            f"⚠️ <b>SIGNAL SKIPPED</b>\n"
+                            f"Direction: <b>{direction.value}</b> | Price: <code>{real_price:.2f}</code>\n"
+                            f"Reason: <i>Price too high — no profit margin (>{MAX_PRICE})</i>",
+                            self.telegram_token, self.chat_id
+                        )
                     print(f"[SKIP] {direction.value} price too high (no profit): {real_price:.2f}")
                     return False
 
@@ -1299,13 +1306,23 @@ class AutoTrader:
                         self.bankroll -= actual_fill_cost
                         print(f"[RESOLVE] Order {window._order_id[:15]}... FILLED: {filled:.1f} shares | deduct ${actual_fill_cost:.2f}")
                     else:
-                        # Never filled — cancel and skip
+                        # Never filled — cancel and notify
                         try:
                             client.cancel(window._order_id)
                         except Exception:
                             pass
                         print(f"[RESOLVE] Order {window._order_id[:15]}... never filled → SKIP")
                         window.result = "SKIP (unfilled)"
+                        # Telegram: order expired
+                        if self.telegram_token and self.chat_id:
+                            timeout_msg = (
+                                f"⏰ <b>ORDER EXPIRED</b>\n"
+                                f"Order  : <code>{window._order_id[:20]}...</code>\n"
+                                f"Action : <b>{'BUY YES' if window.direction == Direction.UP else 'BUY NO'}</b>\n"
+                                f"Price  : <code>{window.entry_price:.2f}</code> | Shares: <code>{window._actual_shares:.1f}</code>\n"
+                                f"Reason : <i>Window closed before order filled</i>"
+                            )
+                            send_telegram(timeout_msg, self.telegram_token, self.chat_id)
                         if window in self._pending_live:
                             self._pending_live.remove(window)
                         log_window(window)
