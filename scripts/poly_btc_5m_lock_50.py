@@ -495,11 +495,12 @@ def place_live_order(
     price: float,
     funder: str = None,
 ) -> Dict:
-    """Place live order via CLOB V2 with POLY_1271 + deposit wallet.
+    """Place MARKET order via CLOB V2 (immediate fill at best price).
     Returns {"success": True, ...} or {"success": False, "error": "reason"}"""
     try:
         _patch_httpx_proxy()
-        from py_clob_client_v2 import ClobClient, ApiCreds, OrderArgs, OrderType, SignatureTypeV2
+        from py_clob_client_v2 import ClobClient, ApiCreds, SignatureTypeV2
+        from py_clob_client_v2.clob_types import MarketOrderArgsV2
         from py_clob_client_v2.constants import POLYGON
         from web3 import Web3
 
@@ -520,66 +521,59 @@ def place_live_order(
             funder=funder,
         )
 
-        # DO NOT cancel previous orders — GTC needs time to fill!
-        # cancel_all_clob_orders(client)  # ← removed: was killing orders before they could match
-
-        # Fix: size = shares (bukan USDC). Min 5 shares.
-        shares = max(5.0, size_usdc / price) if price > 0 else 5.0
-
-        order_args = OrderArgs(
+        print(f"[MARKET ORDER] ${size_usdc:.2f} USDC → {token_id[:15]}...")
+        
+        order_args = MarketOrderArgsV2(
             token_id=token_id,
-            price=price,
-            size=shares,
+            amount=size_usdc,  # USD amount to spend
             side="BUY",
             builder_code=BUILDER_CODE,
         )
-
-        print(f"[LIVE] ${size_usdc:.2f} USDC = {shares:.1f} shares @ {price:.2f} | {token_id[:15]}...")
-        resp = client.create_and_post_order(order_args, order_type=OrderType.GTC)
+        
+        resp = client.create_and_post_market_order(order_args)
 
         if not resp:
             return {"success": False, "error": "CLOB API empty response — network issue?"}
 
-        status = resp.get("status", "?")
         order_id = resp.get("orderID") or resp.get("id", "?")
-        print(f"[LIVE] ID: {order_id} | Status: {status}")
+        status = resp.get("status", "?")
+        print(f"[MARKET] ID: {order_id} | Status: {status}")
 
-        if status == "matched":
-            # Immediately matched
+        if resp.get("success") or status == "matched":
+            # Market order filled — get actual fill details
             filled = check_order_fill(client, order_id)
-            fill_shares = filled if (filled and filled > 0) else shares
-            print(f"✅ Instantly MATCHED! Filled: {fill_shares:.1f} shares")
+            # Calculate actual shares from response if check_order_fill fails
+            if not filled or filled <= 0:
+                maker_amount = float(resp.get("maker_amount", 0) or resp.get("taker_amount", 0) or 0)
+                filled = maker_amount if maker_amount > 0 else (size_usdc / price if price > 0 else 5.0)
+            
+            # Try to get actual avg fill price
+            actual_price = price  # fallback
+            if filled > 0:
+                actual_price = size_usdc / filled  # USD / shares = avg price per share
+            
+            print(f"✅ MARKET FILLED! {filled:.1f} shares ~${actual_price:.2f}/share | Cost: ${size_usdc:.2f}")
             return {
                 "success": True,
                 "order_id": order_id, "status": "matched",
-                "shares": fill_shares, "price": price,
-                "cost": fill_shares * price, "token_id": token_id,
-            }
-
-        elif status in ("live", "unmatched") or resp.get("success"):
-            # GTC order placed — leave it open to fill over time
-            print(f"✅ GTC order LIVE — waiting for match")
-            return {
-                "success": True,
-                "order_id": order_id, "status": "live",
-                "shares": shares, "price": price,
-                "cost": shares * price, "token_id": token_id,
+                "shares": filled, "price": actual_price,
+                "cost": size_usdc, "token_id": token_id,
             }
 
         else:
             err_msg = resp.get("errorMsg", str(resp))
-            print(f"[ERROR] {err_msg}")
-            return {"success": False, "error": f"CLOB rejected: {err_msg[:150]}"}
+            print(f"[MARKET ERROR] {err_msg}")
+            return {"success": False, "error": f"Market order rejected: {err_msg[:150]}"}
 
     except Exception as e:
         err = str(e)
         if "couldn't be fully filled" in err or "FOK" in err:
-            return {"success": False, "error": f"No sell orders at ${price:.2f} — zero liquidity"}
+            return {"success": False, "error": f"No liquidity at market — zero sell orders"}
         elif "not enough" in err.lower() or "insufficient" in err.lower():
             return {"success": False, "error": "Insufficient pUSD in deposit wallet"}
         elif "timeout" in err.lower() or "timed out" in err.lower():
             return {"success": False, "error": "Polymarket API timeout — retry next window"}
-        print(f"[LIVE ERROR] {err[:200]}")
+        print(f"[MARKET ERROR] {err[:200]}")
         return {"success": False, "error": f"API error: {err[:120]}"}
 
 
@@ -1137,41 +1131,28 @@ class AutoTrader:
                 self.yes_token, self.no_token = fetch_btc_5m_market_tokens(window.start)
                 token = self.yes_token if direction == Direction.UP else self.no_token
                 if token:
-                    # Apply price buffer to cross spread (dynamic: max($0.10 or 20% of price))
-                    buffer = max(BUY_PRICE_BUFFER, actual_price * 0.20)
-                    order_price = min(actual_price + buffer, 0.95)
                     print(f"[LIVE ORDER] Token: {token[:20]}... | {direction.value}")
-                    print(f"[LIVE ORDER] Bet: ${bet_usdc:.2f} | Signal: {actual_price:.2f} → Limit: {order_price:.2f}")
-                    order_result = place_live_order(self._private_key, self.clob_creds, token, bet_usdc, order_price, self.deposit_wallet)
+                    print(f"[LIVE ORDER] MARKET BUY ${bet_usdc:.2f} | Signal: {actual_price:.2f}")
+                    order_result = place_live_order(self._private_key, self.clob_creds, token, bet_usdc, actual_price, self.deposit_wallet)
                     if order_result.get("success"):
-                        # ✅ TRACK WITH REAL ORDER NUMBERS (signal price, not limit price)
-                        real_status = order_result["status"]
+                        # ✅ MARKET ORDER FILLED — use real fill details
                         real_shares = order_result["shares"]
                         real_cost = order_result["cost"]
+                        fill_price = order_result.get("price", actual_price)
                         window._order_id = order_result["order_id"]
                         window._is_live = True
-                        window._order_status = real_status
-                        window._actual_price = actual_price  # Signal price (conservative)
+                        window._actual_price = fill_price
                         window._actual_shares = real_shares
                         window._actual_cost = real_cost
-                        window.entry_price = actual_price
+                        window.entry_price = fill_price
                         window.size = real_shares
-
-                        if real_status == "matched":
-                            # Order already filled — deduct immediately
-                            status_label = "MATCHED"
-                            is_filled = True
-                        else:
-                            # GTC order live — deduct only when fill confirmed in resolve
-                            status_label = "LIVE (pending fill)"
-                            is_filled = False
 
                         msg_live = (
                             f"🤖 <b>AUTO-TRADE EXECUTED</b>\n"
-                            f"Status  : <b>{status_label}</b>\n"
+                            f"Type    : <b>MARKET ORDER</b>\n"
                             f"Action  : <b>{action}</b>\n"
                             f"Amount  : <code>${real_cost:.2f} USDC</code>\n"
-                            f"Shares  : <code>{real_shares:.1f}</code> | Limit <code>{order_price:.2f}</code>\n"
+                            f"Filled  : <code>{real_shares:.1f} shares</code> @ ~<code>{fill_price:.2f}</code>/share\n"
                             f"ID  : <code>{order_result['order_id'][:20]}...</code>\n"
                             f"<a href=\"{market_url}\">🔗 Buka Market</a>"
                         )
@@ -1206,13 +1187,10 @@ class AutoTrader:
         window.traded      = True
         window.direction   = direction
         self.daily_stats.trades += 1
-        # Only deduct bankroll for PAPER or MATCHED orders. GTC live orders wait for fill.
-        if not window._is_live or window._order_status == "matched":
-            deduct = window._actual_cost if window._is_live else total_cost
-            self.bankroll -= deduct
-            print(f"[TRADE] Bankroll: ${self.bankroll:.2f}")
-        else:
-            print(f"[TRADE] GTC order pending — bankroll unchanged: ${self.bankroll:.2f}")
+        # Market orders: always deduct (order is filled immediately)
+        deduct = window._actual_cost if window._is_live else total_cost
+        self.bankroll -= deduct
+        print(f"[TRADE] Bankroll: ${self.bankroll:.2f}")
         window.result = "PENDING"
         log_window(window)
         log_stats(self.daily_stats, self.bankroll, self.mode.value)
@@ -1276,60 +1254,9 @@ class AutoTrader:
             log_window(window)
             return
 
-        # ── LIVE ORDER: check fill first, then resolve ──────────────
+        # ── LIVE ORDER: Polymarket API, fallback to Chainlink ──────
         if window._is_live and window._order_id:
-            # If order was "live" (GTC, not yet matched), check fill now
-            if window._order_status in ("live", "unmatched"):
-                try:
-                    _patch_httpx_proxy()
-                    from py_clob_client_v2 import ClobClient, ApiCreds, SignatureTypeV2
-                    from py_clob_client_v2.constants import POLYGON
-                    api_creds = ApiCreds(
-                        api_key=self.clob_creds["api_key"],
-                        api_secret=self.clob_creds["api_secret"],
-                        api_passphrase=self.clob_creds["api_passphrase"],
-                    )
-                    client = ClobClient(
-                        host=CLOB_HOST, chain_id=POLYGON,
-                        key=self._private_key, creds=api_creds,
-                        signature_type=SignatureTypeV2.POLY_1271,
-                        funder=self.deposit_wallet,
-                    )
-                    filled = check_order_fill(client, window._order_id)
-                    if filled and filled > 0:
-                        # Order filled! Deduct bankroll now and update tracking
-                        actual_fill_cost = filled * window.entry_price
-                        window._actual_shares = filled
-                        window._actual_cost = actual_fill_cost
-                        window.size = filled
-                        window._order_status = "filled"
-                        self.bankroll -= actual_fill_cost
-                        print(f"[RESOLVE] Order {window._order_id[:15]}... FILLED: {filled:.1f} shares | deduct ${actual_fill_cost:.2f}")
-                    else:
-                        # Never filled — cancel and notify
-                        try:
-                            client.cancel(window._order_id)
-                        except Exception:
-                            pass
-                        print(f"[RESOLVE] Order {window._order_id[:15]}... never filled → SKIP")
-                        window.result = "SKIP (unfilled)"
-                        # Telegram: order expired
-                        if self.telegram_token and self.chat_id:
-                            timeout_msg = (
-                                f"⏰ <b>ORDER EXPIRED</b>\n"
-                                f"Order  : <code>{window._order_id[:20]}...</code>\n"
-                                f"Action : <b>{'BUY YES' if window.direction == Direction.UP else 'BUY NO'}</b>\n"
-                                f"Price  : <code>{window.entry_price:.2f}</code> | Shares: <code>{window._actual_shares:.1f}</code>\n"
-                                f"Reason : <i>Window closed before order filled</i>"
-                            )
-                            send_telegram(timeout_msg, self.telegram_token, self.chat_id)
-                        if window in self._pending_live:
-                            self._pending_live.remove(window)
-                        log_window(window)
-                        return
-                except Exception as e:
-                    print(f"[RESOLVE] Fill check error: {e}")
-            # Try Polymarket API once (don't block — fallback to Chainlink)
+            # Market orders always fill immediately — no GTC pending check needed
             pm_won = self._check_polymarket_resolution(window)
             if pm_won is not None:
                 won = pm_won  # Use Polymarket resolution
@@ -1340,9 +1267,6 @@ class AutoTrader:
                     (window.direction == Direction.UP   and window.final_spread > 0)
                 )
                 print(f"[RESOLVE] Polymarket API unavailable — using Chainlink (same oracle)")
-            # Remove from pending if it was deferred
-            if window in self._pending_live:
-                self._pending_live.remove(window)
         else:
             # Paper / fallback: use Chainlink boundary price
             won = (
@@ -1430,28 +1354,11 @@ class AutoTrader:
             window_start  = get_window_start(now)
             seconds_into  = (now - window_start).total_seconds()
 
-            # ── Retry pending live trades from previous cycles ─────────
-            if self._pending_live:
-                resolved_now = []
-                for pw in self._pending_live:
-                    result = self._check_polymarket_resolution(pw)
-                    if result is not None:
-                        # Polymarket resolved — finalize
-                        pw.final_spread = btc_price - pw.ptb
-                        self._finalize_window_result(pw, result)
-                        resolved_now.append(pw)
-                for pw in resolved_now:
-                    self._pending_live.remove(pw)
-                    self.all_time_trades.append(pw)
-
             # ── New window ─────────────────────────────────────────────────
             if self.current_window is None or self.current_window.start != window_start:
                 if self.current_window:
-                    # Don't resolve if already in pending_live (handled above)
-                    if self.current_window not in self._pending_live:
-                        self._resolve_window(self.current_window, btc_price)
-                    if self.current_window not in self._pending_live:
-                        self.all_time_trades.append(self.current_window)
+                    self._resolve_window(self.current_window, btc_price)
+                    self.all_time_trades.append(self.current_window)
 
                 ptb = btc_price
                 if seconds_into > 5:
