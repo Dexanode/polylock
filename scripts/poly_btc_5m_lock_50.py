@@ -42,7 +42,7 @@ ALERT_WINDOW_START   = 3 * 60 + 30  # 210s — start of LOCK zone (lebih awal, b
 ALERT_WINDOW_END     = 4 * 60 + 20  # 260s — end of LOCK zone (stop 40s sebelum close)
 FEE_RATE             = 0.02       # Polymarket taker fee
 MIN_ORDER_USDC       = 1.0        # Polymarket minimum order $1
-BUY_PRICE_BUFFER     = 0.06       # Add to price to cross spread & ensure fill
+BUY_PRICE_BUFFER     = 0.10       # Add to price to cross spread & ensure fill (min $0.10)
 
 def fetch_polymarket_balance(private_key: str, clob_creds: Optional[Dict] = None) -> Optional[float]:
     if not clob_creds:
@@ -1141,8 +1141,9 @@ class AutoTrader:
                 self.yes_token, self.no_token = fetch_btc_5m_market_tokens(window.start)
                 token = self.yes_token if direction == Direction.UP else self.no_token
                 if token:
-                    # Apply price buffer to cross spread (limit order at higher price = guaranteed fill)
-                    order_price = min(actual_price + BUY_PRICE_BUFFER, 0.99)
+                    # Apply price buffer to cross spread (dynamic: max($0.10 or 20% of price))
+                    buffer = max(BUY_PRICE_BUFFER, actual_price * 0.20)
+                    order_price = min(actual_price + buffer, 0.95)
                     print(f"[LIVE ORDER] Token: {token[:20]}... | {direction.value}")
                     print(f"[LIVE ORDER] Bet: ${bet_usdc:.2f} | Signal: {actual_price:.2f} → Limit: {order_price:.2f}")
                     order_result = place_live_order(self._private_key, self.clob_creds, token, bet_usdc, order_price, self.deposit_wallet)
@@ -1207,10 +1208,15 @@ class AutoTrader:
         try:
             ts = int(window.start.timestamp())
             slug = f"btc-updown-5m-{ts}"
-            url = f"{GAMMA_HOST}/markets/{slug}"
+            # Gamma API uses query param, returns array
+            url = f"{GAMMA_HOST}/markets?slug={slug}"
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read())
+                markets = json.loads(resp.read())
+            
+            if not markets or not isinstance(markets, list):
+                return None
+            data = markets[0]
 
             closed = data.get("closed", False)
             outcome = data.get("outcome", "")  # "Yes" or "No"
@@ -1252,22 +1258,22 @@ class AutoTrader:
             log_window(window)
             return
 
-        # ── LIVE ORDER: check Polymarket directly ──────────────────────
+        # ── LIVE ORDER: try Polymarket API, fallback to Chainlink ────
         if window._is_live and window._order_id:
-            # Wait up to 60s for Polymarket to resolve, polling every 10s
-            for attempt in range(6):
-                if attempt > 0:
-                    time.sleep(10)
-                won = self._check_polymarket_resolution(window)
-                if won is not None:
-                    break
-            if won is None:
-                # Still unresolved after 60s — defer to pending list
-                print(f"[RESOLVE] Live order {window._order_id[:15]}... still unresolved after 60s — deferring")
-                window.result = "PENDING"
-                log_window(window)
-                self._pending_live.append(window)
-                return
+            # Try Polymarket API once (don't block — fallback to Chainlink)
+            pm_won = self._check_polymarket_resolution(window)
+            if pm_won is not None:
+                won = pm_won  # Use Polymarket resolution
+            else:
+                # Fallback: Chainlink boundary price (same oracle Polymarket uses)
+                won = (
+                    (window.direction == Direction.DOWN and window.final_spread < 0) or
+                    (window.direction == Direction.UP   and window.final_spread > 0)
+                )
+                print(f"[RESOLVE] Polymarket API unavailable — using Chainlink (same oracle)")
+            # Remove from pending if it was deferred
+            if window in self._pending_live:
+                self._pending_live.remove(window)
         else:
             # Paper / fallback: use Chainlink boundary price
             won = (
