@@ -48,6 +48,14 @@ def fetch_polymarket_balance(private_key: str, clob_creds: Optional[Dict] = None
     """Fetch real Polymarket pUSD balance via CLOB SDK (POLY_1271)."""
     if not clob_creds:
         return None
+    # Suppress SSL warnings for Polymarket CLOB API
+    try:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except Exception:
+        pass
+    import ssl
+    ssl._create_default_https_context = ssl._create_unverified_context
     try:
         _patch_httpx_proxy()
         from py_clob_client_v2 import ClobClient, ApiCreds, SignatureTypeV2
@@ -85,9 +93,10 @@ def fetch_usdc_balance(wallet_address: str) -> float:
     payload = json.dumps({"jsonrpc":"2.0","method":"eth_call","params":[{"to":USDC_CONTRACT,"data":BALANCE_SELECTOR},"latest"],"id":1}).encode()
     for rpc in POLYGON_RPCS:
         try:
-            req = urllib.request.Request(rpc, data=payload, headers={"Content-Type":"application/json"})
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                result = json.loads(resp.read())
+            import httpx
+            resp = httpx.post(rpc, content=payload, headers={"Content-Type":"application/json"}, timeout=8, verify=False)
+            resp.raise_for_status()
+            result = resp.json()
             hex_val = result.get("result", "0x0")
             if hex_val and hex_val != "0x":
                 return int(hex_val, 16) / 1e6
@@ -276,9 +285,10 @@ def fetch_polymarket_real_prices(window_start: datetime) -> Tuple[float, float]:
         ts   = int(window_start.timestamp())
         slug = f"btc-updown-5m-{ts}"
         url  = f"{GAMMA_HOST}/markets?slug={slug}"
-        req  = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            markets = json.loads(resp.read())
+        import httpx
+        resp = httpx.get(url, timeout=8, verify=False)
+        resp.raise_for_status()
+        markets = resp.json()
         if not markets:
             return 0.0, 0.0
         m      = markets[0]
@@ -306,9 +316,11 @@ def fetch_btc_5m_market_tokens(window_start: Optional[datetime] = None) -> Tuple
         slug = f"btc-updown-5m-{ts}"
         try:
             url = f"{GAMMA_HOST}/markets?slug={slug}"
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                markets = json.loads(resp.read())
+            import httpx
+            # Use patched httpx client which ignores proxy and SSL verify if needed
+            resp = httpx.get(url, timeout=8, verify=False)
+            resp.raise_for_status()
+            markets = resp.json()
             if markets:
                 tokens = _parse_tokens_with_outcomes(markets[0])
                 if tokens[0]:
@@ -321,9 +333,10 @@ def fetch_btc_5m_market_tokens(window_start: Optional[datetime] = None) -> Tuple
     try:
         from urllib.parse import quote
         url = f"{GAMMA_HOST}/public-search?q={quote('bitcoin up or down')}"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            data = json.loads(resp.read())
+        import httpx
+        resp = httpx.get(url, timeout=8, verify=False)
+        resp.raise_for_status()
+        data = resp.json()
         now_ts = datetime.now(timezone.utc).timestamp()
         best_ev = None
         best_diff = float("inf")
@@ -773,9 +786,10 @@ def fetch_btc_binance_signal() -> Dict:
     - momentum_pct  : slope 3-candle terbaru vs 3-candle sebelumnya
     """
     try:
-        req = urllib.request.Request(KLINES_URL, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
+        import httpx
+        resp = httpx.get(KLINES_URL, timeout=10, verify=False)
+        resp.raise_for_status()
+        data = resp.json()
         if not data or len(data) < 8:
             return {}
 
@@ -1019,6 +1033,9 @@ class AutoTrader:
 
         # 3. Compute deposit wallet & fetch balance via SDK (POLY_1271)
         from web3 import Web3
+        import ssl, urllib3
+        ssl._create_default_https_context = ssl._create_unverified_context
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         eoa = Web3().eth.account.from_key(self._private_key).address
         self.deposit_wallet = compute_deposit_wallet_address(eoa)
         print(f"🏦 Deposit Wallet: {self.deposit_wallet}")
