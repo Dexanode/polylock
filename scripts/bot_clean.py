@@ -1299,8 +1299,10 @@ class AutoTrader:
             return False, f"COUNTER_MOMENTUM_DOWN ({momentum:.4f}%)"
 
         win_prob = estimate_win_probability(abs_spread)
+        # NOTE: EV recalculated with real price in _execute_trade()
+        # This is preliminary EV using signal estimate
         ev       = calculate_ev(entry_price, win_prob)
-        print(f"[SIGNAL] WinProb: {win_prob:.0%} | EV: ${ev:.4f}/share")
+        print(f"[SIGNAL] WinProb: {win_prob:.0%} | EV(est): ${ev:.4f}/share")
 
         if ev < EV_THRESHOLD:
             return False, f"NEGATIVE_EV (${ev:.4f})"
@@ -1359,6 +1361,8 @@ class AutoTrader:
             bet_usdc     = max(cost, MIN_ORDER_USDC)
             profit_est   = round(bet_usdc / actual_price * (1 - FEE_RATE) - bet_usdc, 2)
             win_prob     = estimate_win_probability(abs(spread))
+            real_ev      = calculate_ev(actual_price, win_prob)
+            print(f"[EV] Real price {actual_price:.2f} → EV: ${real_ev:.4f}/share (was est: ${calculate_ev(entry_price, win_prob):.4f})")
             emoji        = "🟢" if direction == Direction.UP else "🔴"
             action       = "BUY YES" if direction == Direction.UP else "BUY NO"
             ts           = int(window.start.timestamp())
@@ -1749,13 +1753,13 @@ class AutoTrader:
                         self._notify(f"⏸️ *LOCK SKIPPED* — {reason}\nWindow: `{format_time(w.start)}`")
                 else:
                     # All filters passed
-                    ev = calculate_ev(entry_price, estimate_win_probability(abs_spread))
+                    ev_est = calculate_ev(entry_price, estimate_win_probability(abs_spread))
                     alert_msg = (
                         f"🚨 *LOCK SETUP* 🚨\n"
                         f"Window: `{format_time(w.start)}`\n"
                         f"PTB: `${w.ptb:,.2f}` | BTC: `${btc_price:,.2f}`\n"
                         f"Spread: `{spread:+.2f}` | Dir: *{direction.value}*\n"
-                        f"Entry: `{entry_price:.2f}` | Size: `{size}` | EV: `${ev:.4f}`\n"
+                        f"Entry: `{entry_price:.2f}` | Size: `{size}` | EV(est): `${ev_est:.4f}`\n"
                         f"Mode: *{self.mode.value.upper()}*"
                     )
                     self._notify(alert_msg)
