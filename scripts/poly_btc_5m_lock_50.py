@@ -19,6 +19,19 @@ from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 
+
+# ── Auto-load .env ──────────────────────────────────────────
+_ENV_FILE = os.path.join(os.path.dirname(__file__), ".env")
+if os.path.exists(_ENV_FILE):
+    with open(_ENV_FILE) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _key, _val = _line.split("=", 1)
+                _key, _val = _key.strip(), _val.strip()
+                if _key and _val and _key not in os.environ:
+                    os.environ[_key] = _val
+
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
@@ -29,6 +42,49 @@ ALERT_WINDOW_START   = 3 * 60 + 30  # 210s — start of LOCK zone (lebih awal, b
 ALERT_WINDOW_END     = 4 * 60 + 20  # 260s — end of LOCK zone (stop 40s sebelum close)
 FEE_RATE             = 0.02       # Polymarket taker fee
 MIN_ORDER_USDC       = 1.0        # Polymarket minimum order $1
+
+def fetch_polymarket_balance(private_key: str, clob_creds: Optional[Dict] = None) -> Optional[float]:
+    if not clob_creds:
+        return None
+    try:
+        import hmac, hashlib, base64
+        ts = str(int(time.time() * 1000))
+        message = ts + "GET" + "/balance-allowance" + ""
+        raw_secret = clob_creds["api_secret"]
+        # Auto-pad jika secret belum base64-padded
+        missing_padding = len(raw_secret) % 4
+        if missing_padding:
+            raw_secret += "=" * (4 - missing_padding)
+        secret = base64.b64decode(raw_secret)
+        sig = base64.b64encode(hmac.new(secret, message.encode(), hashlib.sha256).digest()).decode()
+        headers = {"POLY-API-KEY": clob_creds["api_key"], "POLY-TIMESTAMP": ts, "POLY-SIGNATURE": sig, "POLY-PASSPHRASE": clob_creds["api_passphrase"]}
+        req = urllib.request.Request(f"{CLOB_HOST}/balance-allowance", headers=headers)
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read())
+        # V2 returns {"balance": x, "allowance": y} or just {"balance": x}
+        balance = float(data.get("balance", 0))
+        allowance = float(data.get("allowance", 0))
+        print(f"[BALANCE] Polymarket: ${balance:,.2f} (allowance: ${allowance:,.2f})")
+        return balance if balance > 0 else allowance
+    except Exception as e:
+        print(f"[WARN] Polymarket balance: {e}")
+        return None
+
+def fetch_usdc_balance(wallet_address: str) -> float:
+    USDC_CONTRACT = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
+    BALANCE_SELECTOR = "0x70a08231" + wallet_address[2:].lower().rjust(64, "0")
+    payload = json.dumps({"jsonrpc":"2.0","method":"eth_call","params":[{"to":USDC_CONTRACT,"data":BALANCE_SELECTOR},"latest"],"id":1}).encode()
+    for rpc in POLYGON_RPCS:
+        try:
+            req = urllib.request.Request(rpc, data=payload, headers={"Content-Type":"application/json"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                result = json.loads(resp.read())
+            hex_val = result.get("result", "0x0")
+            if hex_val and hex_val != "0x":
+                return int(hex_val, 16) / 1e6
+        except Exception:
+            continue
+    return 0.0
 
 # Signal filters
 MIN_VOLUME_RATIO     = 0.25       # skip if volume < 0.25x 10-candle avg (diturunkan dari 0.5x — spike inflasi avg)
@@ -63,6 +119,9 @@ KLINES_5M_URL = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=5
 # Polymarket CLOB
 CLOB_HOST  = "https://clob.polymarket.com"
 GAMMA_HOST = "https://gamma-api.polymarket.com"
+BUILDER_CODE = os.environ.get("POLYMARKET_BUILDER_CODE", "0x2111a204350f2c552401b7d34b7cb61021e32b68a17a15ef712b978fd991f55d")
+DEPOSIT_WALLET_FACTORY = "0x00000000000Fb5C9ADea0298D729A0CB3823Cc07"
+DEPOSIT_WALLET_IMPLEMENTATION = "0x58CA52ebe0DadfdF531Cde7062e76746de4Db1eB"
 
 # Persistent log file — dashboard reads ini, survive restart
 LOG_DIR      = os.path.join(os.path.dirname(__file__), "..", "logs")
@@ -115,6 +174,28 @@ def log_stats(stats, bankroll: float, mode: str = "paper") -> None:
 # LIVE TRADING — CLOB Integration
 # ---------------------------------------------------------------------------
 
+def compute_deposit_wallet_address(owner: str) -> str:
+    """Compute UUPS deposit wallet address via CREATE2."""
+    from eth_utils import to_bytes, to_checksum_address, keccak
+    from eth_abi import encode
+    CONST1 = "0xcc3735a920a3ca505d382bbc545af43d6000803e6038573d6000fd5b3d6000f3"
+    CONST2 = "0x5155f3363d3d373d3d363d7f360894a13ba1a3210667c828492db98dca3e2076"
+    PREFIX = 0x61003D3D8160233D3973
+    factory = to_checksum_address(DEPOSIT_WALLET_FACTORY)
+    impl = to_checksum_address(DEPOSIT_WALLET_IMPLEMENTATION)
+    owner_bytes = to_bytes(hexstr=owner).rjust(32, b"\x00")
+    args = encode(["address", "bytes32"], [factory, owner_bytes])
+    salt = keccak(args)
+    n = len(args)
+    combined = PREFIX + (n << 56)
+    init_code = (combined.to_bytes(10, "big") + to_bytes(hexstr=impl) +
+                 to_bytes(hexstr="0x6009") + to_bytes(hexstr=CONST2) +
+                 to_bytes(hexstr=CONST1) + args)
+    code_hash = "0x" + keccak(init_code).hex()
+    wallet = "0x" + keccak(b"\xff" + to_bytes(hexstr=factory) + salt + to_bytes(hexstr=code_hash)).hex()[-40:]
+    return to_checksum_address(wallet)
+
+
 def load_or_create_clob_creds(private_key: str) -> Optional[Dict]:
     """
     Load saved CLOB API creds dari file, atau generate baru dari wallet.
@@ -133,13 +214,24 @@ def load_or_create_clob_creds(private_key: str) -> Optional[Dict]:
         except Exception:
             pass
 
-    # Generate / derive creds
+    # Generate / derive creds with POLY_1271 + funder
     try:
         _patch_httpx_proxy()
-        from py_clob_client.client import ClobClient
-        from py_clob_client.constants import POLYGON
+        from py_clob_client_v2 import ClobClient, SignatureTypeV2
+        from py_clob_client_v2.constants import POLYGON
+        from web3 import Web3
 
-        client = ClobClient(host=CLOB_HOST, chain_id=POLYGON, key=private_key)
+        eoa = Web3().eth.account.from_key(private_key).address
+        funder = compute_deposit_wallet_address(eoa)
+        print(f"💳 EOA: {eoa}")
+        print(f"🏦 Deposit Wallet: {funder}")
+
+        client = ClobClient(
+            host=CLOB_HOST, chain_id=POLYGON,
+            key=private_key,
+            signature_type=SignatureTypeV2.POLY_1271,
+            funder=funder,
+        )
 
         # Coba derive dulu (jika wallet sudah pernah terdaftar)
         try:
@@ -349,7 +441,7 @@ def _patch_httpx_proxy():
     if not proxy_url:
         return
     try:
-        import py_clob_client.http_helpers.helpers as _helpers
+        import py_clob_client_v2.http_helpers.helpers as _helpers
 
         if getattr(_helpers, "_proxy_patched", False):
             return
@@ -372,68 +464,72 @@ def place_live_order(
     token_id: str,
     size_usdc: float,
     price: float,
+    funder: str = None,
 ) -> bool:
-    """
-    Place BUY order di Polymarket CLOB.
-    size_usdc = jumlah USDC yang mau diinvest
-    price     = harga per share (0.01–0.99)
-    Returns True jika order berhasil.
-    """
+    """Place live order via CLOB V2 with POLY_1271 + deposit wallet."""
     try:
-        # Patch httpx dulu agar proxy dipakai oleh py_clob_client
         _patch_httpx_proxy()
-
-        from py_clob_client.client import ClobClient
-        from py_clob_client.constants import POLYGON
-        from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
-        from py_clob_client.order_builder.constants import BUY
+        from py_clob_client_v2 import ClobClient, ApiCreds, OrderArgs, OrderType, SignatureTypeV2
+        from py_clob_client_v2.constants import POLYGON
+        from web3 import Web3
 
         api_creds = ApiCreds(
             api_key=creds["api_key"],
             api_secret=creds["api_secret"],
             api_passphrase=creds["api_passphrase"],
         )
+        if funder is None:
+            funder = compute_deposit_wallet_address(
+                Web3().eth.account.from_key(private_key).address
+            )
+
         client = ClobClient(
             host=CLOB_HOST, chain_id=POLYGON,
             key=private_key, creds=api_creds,
+            signature_type=SignatureTypeV2.POLY_1271,
+            funder=funder,
         )
 
-        # Shares = USDC / price_per_share
-        shares = round(size_usdc / price, 2)
-        if shares < 0.1:
-            print(f"[WARN] Size too small: {shares} shares (min 0.1)")
-            return False
+        # Fix: size = shares (bukan USDC). Min 5 shares.
+        shares = max(5.0, size_usdc / price) if price > 0 else 5.0
 
         order_args = OrderArgs(
             token_id=token_id,
             price=price,
             size=shares,
-            side=BUY,
+            side="BUY",
+            builder_code=BUILDER_CODE,
         )
 
-        print(f"[LIVE] Signing order: {shares} shares @ {price} (${size_usdc:.2f} USDC)...")
-        signed_order = client.create_order(order_args)
-        resp = client.post_order(signed_order, OrderType.GTC)
+        print(f"[LIVE] ${size_usdc:.2f} USDC = {shares:.1f} shares @ {price:.2f} | {token_id[:15]}...")
+        resp = client.create_and_post_order(order_args, order_type=OrderType.GTC)
 
-        print(f"[LIVE] Order response: {resp}")
-
-        if resp and (resp.get("success") or resp.get("orderID") or resp.get("id")):
+        if resp:
+            status = resp.get("status", "?")
             order_id = resp.get("orderID") or resp.get("id", "?")
-            print(f"✅ Order placed! ID: {order_id}")
-            return True
-        else:
-            err = resp.get("errorMsg") or resp.get("error") or str(resp) if resp else "no response"
-            print(f"[ERROR] Order rejected: {err}")
-            return False
-
+            print(f"[LIVE] ID: {order_id} | Status: {status}")
+            if status in ("matched", "live") or resp.get("success"):
+                print(f"✅ Order placed! ID: {order_id}")
+                return True
+            elif status == "unmatched":
+                print(f"[LIVE] GTC order live, waiting for match...")
+                return True  # GTC stays open, still success
+            else:
+                print(f"[ERROR] {resp.get('errorMsg', str(resp))}")
+                return False
+        return False
     except Exception as e:
-        print(f"[ERROR] Order placement: {e}")
-        import traceback; traceback.print_exc()
+        err = str(e)
+        if "couldn't be fully filled" in err or "FOK" in err:
+            print(f"[LIVE] No match at {price} — try higher price")
+            return False
+        elif "not enough" in err.lower() or "insufficient" in err.lower():
+            print(f"[LIVE] Insufficient balance")
+            return False
+        print(f"[LIVE ERROR] {err[:200]}")
         return False
 
 
-# ---------------------------------------------------------------------------
-# ENUMS & DATACLASSES
 # ---------------------------------------------------------------------------
 
 class Mode(Enum):
@@ -601,11 +697,14 @@ def fetch_btc_binance_signal() -> Dict:
 def send_telegram(msg: str, token: str, chat_id: str):
     try:
         url     = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload = json.dumps({"chat_id": chat_id, "text": msg, "parse_mode": "HTML"}).encode()
+        msg_safe = msg.encode("utf-8", errors="replace").decode("utf-8")
+        payload = json.dumps({"chat_id": chat_id, "text": msg_safe, "parse_mode": "HTML"}, ensure_ascii=False).encode("utf-8")
         req     = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=5)
     except Exception as e:
+        import traceback
         print(f"[WARN] Telegram: {e}")
+        traceback.print_exc()
 
 
 # ---------------------------------------------------------------------------
@@ -678,7 +777,14 @@ def format_time(dt: datetime) -> str:
 
 class AutoTrader:
     def __init__(self, args):
-        self.mode               = Mode.LIVE if getattr(args, 'live', False) else Mode.PAPER
+        self.live_mode          = getattr(args, 'live', False)
+        self.signal_only        = getattr(args, 'signal', False)
+        if self.signal_only:
+            self.mode = Mode.PAPER
+        elif self.live_mode:
+            self.mode = Mode.LIVE
+        else:
+            self.mode = Mode.PAPER
         self.telegram_token     = args.telegram_token or os.environ.get("TELEGRAM_TOKEN", "")
         self.chat_id            = args.chat_id or os.environ.get("TELEGRAM_CHAT_ID", "")
         self.spread_threshold   = args.spread
@@ -712,14 +818,14 @@ class AutoTrader:
     # ── BANNER ─────────────────────────────────────────────────────────────
 
     def _print_banner(self):
-        mode_label = "🔴 LIVE — REAL MONEY" if self.mode == Mode.LIVE else "📄 PAPER — no real money"
+        mode_label = "🔴 LIVE — REAL MONEY" if self.mode == Mode.LIVE else ("📡 SIGNAL — Telegram alerts + real prices" if self.signal_only else "📄 PAPER — no real money")
         # Tulis mode ke stats.json saat startup
         log_stats(self.daily_stats, self.bankroll, self.mode.value)
         self._notify(f"""
 {'='*55}
   ₿ POLYMARKET BTC 5m LOCK BOT — $50 THRESHOLD
 {'='*55}
-  Mode:           {self.mode.value.upper()}
+  Mode:           {"SIGNAL" if self.signal_only else self.mode.value.upper()}
   Bankroll:       ${self.bankroll:.2f}
   Spread Target:  ${self.spread_threshold}
   Daily Stop:     ${self.daily_stop}
@@ -733,6 +839,9 @@ class AutoTrader:
 
     def _init_live(self):
         """Setup CLOB credentials dan fetch market tokens untuk live trading."""
+        if self.signal_only:
+            print("📡 SIGNAL-ONLY MODE — Telegram alerts with real Polymarket prices, no orders")
+            return
         if not self._private_key:
             print("❌ POLYMARKET_PRIVATE_KEY not set! Falling back to PAPER.")
             self.mode = Mode.PAPER
@@ -740,16 +849,65 @@ class AutoTrader:
 
         print("🔐 Initializing live trading...")
 
-        # 1. CLOB credentials
+        # 1. CLOB credentials — derive via SDK (ini satu2nya yg valid)
         self.clob_creds = load_or_create_clob_creds(self._private_key)
         if not self.clob_creds:
             print("⚠️  CLOB auth failed — falling back to PAPER mode")
             self.mode = Mode.PAPER
             return
 
+        # Init reusable ClobClient
+        from py_clob_client_v2 import ClobClient, ApiCreds
+        from py_clob_client_v2.constants import POLYGON
+        api_creds_obj = ApiCreds(
+            api_key=self.clob_creds["api_key"],
+            api_secret=self.clob_creds["api_secret"],
+            api_passphrase=self.clob_creds["api_passphrase"],
+        )
+        self.clob_client = ClobClient(
+            host=CLOB_HOST, chain_id=POLYGON,
+            key=self._private_key, creds=api_creds_obj,
+        )
+        print("🤖 ClobClient initialized (EOA)")
+
         # 2. Market tokens — akan di-fetch ulang per window saat LOCK trigger
         print("✅ Live ready! Tokens akan di-fetch per window saat LOCK.")
 
+        # 3. Compute deposit wallet & fetch balance via SDK (POLY_1271)
+        from web3 import Web3
+        eoa = Web3().eth.account.from_key(self._private_key).address
+        self.deposit_wallet = compute_deposit_wallet_address(eoa)
+        print(f"🏦 Deposit Wallet: {self.deposit_wallet}")
+        
+        try:
+            from py_clob_client_v2 import SignatureTypeV2
+            from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
+            
+            # Create client with POLY_1271 for balance check
+            bal_client = ClobClient(
+                host=CLOB_HOST, chain_id=POLYGON,
+                key=self._private_key, creds=api_creds_obj,
+                signature_type=SignatureTypeV2.POLY_1271,
+                funder=self.deposit_wallet,
+            )
+            
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            bal_data = bal_client.get_balance_allowance(params)
+            raw_balance = float(bal_data.get("balance", 0))
+            
+            # Balance in pUSD smallest units (6 decimals)
+            actual_balance = raw_balance / 1_000_000 if raw_balance > 1000 else raw_balance
+            
+            if actual_balance > 0:
+                print(f"💰 Polymarket pUSD: ${actual_balance:,.2f} — bankroll updated")
+                self.bankroll = actual_balance
+                self.initial_bankroll = actual_balance
+            else:
+                print(f"⚠️  No balance on deposit wallet — using --bankroll ${self.bankroll:.2f}")
+                self.initial_bankroll = self.bankroll
+        except Exception as e:
+            print(f"[WARN] SDK balance check: {e}")
+            self.initial_bankroll = self.bankroll
     # ── NOTIFY ─────────────────────────────────────────────────────────────
 
     def _notify(self, msg: str):
@@ -775,7 +933,7 @@ class AutoTrader:
     def _should_stop_trading(self) -> bool:
         if self.daily_stats.profit <= -self.daily_stop:
             return True
-        if self.bankroll < 2.0:
+        if self.bankroll < 1.0:
             return True
         return False
 
@@ -841,7 +999,7 @@ class AutoTrader:
             return False
 
         # ── SIGNAL NOTIFY ──────────────────────────────────────────────────
-        if self.mode == Mode.LIVE:
+        if self.mode == Mode.LIVE or self.signal_only:
             spread = abs_spread or abs(window.final_spread or 0)
 
             # Fetch harga REAL dari Polymarket sebelum kirim sinyal
@@ -902,6 +1060,29 @@ class AutoTrader:
             if self.telegram_token and self.chat_id:
                 send_telegram(msg, self.telegram_token, self.chat_id)
                 print("[TELEGRAM] Notif terkirim ✅")
+
+            # ── LIVE ORDER ────────────────────────────────────────────
+            if self.mode == Mode.LIVE and not self.signal_only:
+                print(f"\n{'='*50}")
+                print(f"[LIVE ORDER] Fetching token + placing order...")
+                print(f"{'='*50}")
+                self.yes_token, self.no_token = fetch_btc_5m_market_tokens(window.start)
+                token = self.yes_token if direction == Direction.UP else self.no_token
+                if token:
+                    print(f"[LIVE ORDER] Token: {token[:20]}... | {direction.value}")
+                    print(f"[LIVE ORDER] Bet: ${bet_usdc:.2f} @ {actual_price:.2f}")
+                    success = place_live_order(self._private_key, self.clob_creds, token, bet_usdc, actual_price, self.deposit_wallet)
+                    if success:
+                        msg_live = f"🤖 <b>AUTO-TRADE EXECUTED</b>\nAction  : <b>{action}</b>\nAmount  : <code>${bet_usdc:.2f} USDC</code>\nPrice   : <code>{actual_price:.2f}</code>\n<a href=\"{market_url}\">🔗 Buka Market</a>"
+                        if self.telegram_token and self.chat_id:
+                            send_telegram(msg_live, self.telegram_token, self.chat_id)
+                        print("[LIVE ORDER] ✅ Order submitted!")
+                    else:
+                        if self.telegram_token and self.chat_id:
+                            send_telegram(f"❌ <b>AUTO-TRADE FAILED</b>\n{action} @ {actual_price:.2f} | ${bet_usdc:.2f} USDC", self.telegram_token, self.chat_id)
+                        print("[LIVE ORDER] ❌ FAILED")
+                else:
+                    print("[LIVE ORDER] ❌ Token not found")
 
         # ── PAPER / Record ─────────────────────────────────────────────────
         else:
@@ -1107,6 +1288,7 @@ class AutoTrader:
 
 def main():
     parser = argparse.ArgumentParser(description="Polymarket BTC 5m LOCK Bot")
+    parser.add_argument("--signal",        action="store_true", help="Signal-only: Telegram alerts + Polymarket price validation (no wallet needed)")
     parser.add_argument("--live",          action="store_true", help="LIVE mode (default: paper)")
     parser.add_argument("--telegram-token", default="",         help="Telegram Bot Token")
     parser.add_argument("--chat-id",        default="",         help="Telegram Chat ID")
@@ -1116,8 +1298,8 @@ def main():
     parser.add_argument("--max-trades",     type=int,   default=20,   help="Max trades per day")
     args = parser.parse_args()
 
-    if args.live and not os.environ.get("POLYMARKET_PRIVATE_KEY"):
-        print("❌ --live requires POLYMARKET_PRIVATE_KEY env var.")
+    if args.live and not args.signal and not os.environ.get("POLYMARKET_PRIVATE_KEY"):
+        print("❌ --live requires POLYMARKET_PRIVATE_KEY env var (use --signal for signal-only mode).")
         sys.exit(1)
 
     try:
