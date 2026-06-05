@@ -47,41 +47,29 @@ BUILDER_CODE = os.environ.get("POLYMARKET_BUILDER_CODE",
 # ═══════════════════════════════════════════════════════════════════════
 
 def compute_deposit_wallet_address(owner: str) -> str:
-    """Deterministic CREATE2 deposit wallet from EOA (same as Polymarket)."""
-    from web3 import Web3
-    owner = owner.lower()
-    salt = "0x0000000000000000000000000000000000000000000000000000000000000000"
-    init_code = (
-        "0x608060405234801561001057600080fd5b506040516020806103ad8339810180"
-        "60405281019080805190602001909291905050508073ffffffffffffffffffff"
-        "ffffffffffffffffffff163373ffffffffffffffffffffffffffffffffffffffff"
-        "161460b0576040517f08c379a000000000000000000000000000000000000000"
-        "0000000000000000008152600401808060200182810382526035815260200180"
-        "7f596f7520617265206e6f74206f776e6572206f66207468697320636f6e7472"
-        "6163742100000000000000000000000000000000000000000000000000000000"
-        "81525060400191505060405180910390fd5b50610241806100c06000396000f3"
-        "fe60806040526004361061003f576000357c0100000000000000000000000000"
-        "000000000000000000000000000000900463ffffffff16806308c379a0146100"
-        "44575b600080fd5b34801561005057600080fd5b506100596100af565b604051"
-        "8080602001828103825283818151815260200191508051906020019080838360"
-        "005b838110156100ad578082015181840152602081019050610092565b505050"
-        "50905090810190601f1680156100da5780820380516001836020036101000a03"
-        "192f168201915b50509250505060405180910390f35b60606040518060400160"
-        "4052807f596f7520617265206e6f74206f776e6572206f66207468697320636f"
-        "6e74726163742100000000000000000000000000000000000000000000000000"
-        "815250600090505b9056fea165627a7a72305820a5e2b9f26a3f9a3b1c74d0a"
-        "3f1a6c1b9c1a3f1a6c1b9c1a3f1a6c1b9c1a3f1a6c0029"
-    )
-    factory = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
-    return Web3.to_checksum_address(
-        Web3.keccak(
-            bytes.fromhex("ff") +
-            bytes.fromhex(factory[2:]) +
-            bytes.fromhex(owner[2:]) +
-            bytes.fromhex(salt[2:]) +
-            Web3.keccak(bytes.fromhex(init_code[2:]))
-        )[12:].hex()
-    )
+    """Compute UUPS deposit wallet address via CREATE2 (same as Polymarket)."""
+    from eth_utils import to_bytes, to_checksum_address, keccak
+    from eth_abi import encode
+    
+    DEPOSIT_WALLET_FACTORY = "0x00000000000Fb5C9ADea0298D729A0CB3823Cc07"
+    DEPOSIT_WALLET_IMPLEMENTATION = "0x58CA52ebe0DadfdF531Cde7062e76746de4Db1eB"
+    CONST1 = "0xcc3735a920a3ca505d382bbc545af43d6000803e6038573d6000fd5b3d6000f3"
+    CONST2 = "0x5155f3363d3d373d3d363d7f360894a13ba1a3210667c828492db98dca3e2076"
+    PREFIX = 0x61003D3D8160233D3973
+    
+    factory = to_checksum_address(DEPOSIT_WALLET_FACTORY)
+    impl = to_checksum_address(DEPOSIT_WALLET_IMPLEMENTATION)
+    owner_bytes = to_bytes(hexstr=owner).rjust(32, b"\x00")
+    args = encode(["address", "bytes32"], [factory, owner_bytes])
+    salt = keccak(args)
+    n = len(args)
+    combined = PREFIX + (n << 56)
+    init_code = (combined.to_bytes(10, "big") + to_bytes(hexstr=impl) +
+                 to_bytes(hexstr="0x6009") + to_bytes(hexstr=CONST2) +
+                 to_bytes(hexstr=CONST1) + args)
+    code_hash = "0x" + keccak(init_code).hex()
+    wallet = "0x" + keccak(b"\xff" + to_bytes(hexstr=factory) + salt + to_bytes(hexstr=code_hash)).hex()[-40:]
+    return to_checksum_address(wallet)
 
 
 def compute_deposit_wallet_address_v2(owner: str) -> str:
@@ -257,7 +245,15 @@ def check_order_fill(client, order_id: str) -> Optional[float]:
 def cancel_all_orders(client) -> int:
     """Cancel all open orders. Returns count cancelled."""
     try:
-        orders = client.get_orders(params={"status": "OPEN"}) or []
+        # Python CLOB v2: use get_orders with params
+        from py_clob_client_v2.order_builder.helpers import GET_ORDERS_PARAMS
+        resp = client._get("orders", params={"status": "open"})
+        if isinstance(resp, list):
+            orders = resp
+        elif isinstance(resp, dict):
+            orders = resp.get("data", resp.get("orders", []))
+        else:
+            orders = []
         count = 0
         for o in orders:
             oid = o.get("orderID") or o.get("id", "")
@@ -650,7 +646,7 @@ class MakerRebateMM:
     # ── Entry point ────────────────────────────────────────────────
 
     def run(self):
-        """Main loop: detect market, enter, cycle until close."""
+        """Main loop: detect NEXT market, wait, enter at open, cycle until close."""
         print(f"\n{'='*55}")
         print(f"  ⚡ MAKER REBATE MM — {self.asset.upper()} {self.duration}")
         print(f"{'='*55}")
@@ -665,23 +661,29 @@ class MakerRebateMM:
             self._notify(f"🟡 <b>MM SIMULATION</b> — {self.asset.upper()} {self.duration}\nSize: {self.trade_size}/side | Max: ${self.max_combined:.2f}")
 
         while True:
-            # Wait for next slot
+            # ── Wait for NEXT market to be detectable ──
             next_ts = self._next_slot_ts()
-            wait_sec = max(0, next_ts - time.time())
-            if wait_sec > 5:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Waiting {wait_sec:.0f}s for next slot ({next_ts})...")
-                time.sleep(min(wait_sec, 30))
+            secs_until = next_ts - time.time()
+            
+            if secs_until > 60:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Next slot opens in {secs_until:.0f}s — waiting...")
+                time.sleep(min(30, secs_until - 30))
                 continue
 
-            # Detect market
-            slot_ts = self._current_slot_ts()
-            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Detecting market for slot {slot_ts}...")
-            market = self._detect_market(slot_ts)
+            # ── Pre-detect: try to find market before it opens ──
+            market = None
+            deadline = next_ts + 30  # Give 30s after slot start to appear
+            while time.time() < deadline:
+                market = self._detect_market(next_ts)
+                if market:
+                    break
+                print(f"  Market not live yet, retry in 3s...")
+                time.sleep(3)
 
             if not market:
-                # Maybe market not yet live — retry
-                print(f"  Market not found yet, retrying...")
-                time.sleep(5)
+                print(f"  ❌ Market never appeared for slot {next_ts}")
+                self._notify(f"⏭️ <b>MM SKIP</b> — Market not found for slot {next_ts}")
+                time.sleep(self.slot_sec)
                 continue
 
             yes_token, no_token = extract_token_ids(market)
