@@ -583,12 +583,9 @@ def place_live_order(
         if not has_liq:
             return {"success": False, "error": f"Thin orderbook — not enough asks for ${size_usdc:.2f} (best ask: {best_ask:.2f})"}
         
-        # Reject order if best ask is way off signal price (stale/manipulated orderbook)
-        MAX_ASK_DRIFT = 0.15
-        if best_ask > 0 and abs(best_ask - price) > MAX_ASK_DRIFT:
-            drift = abs(best_ask - price)
-            print(f"[SKIP] Best ask {best_ask:.2f} drifts {drift:.2f} from signal {price:.2f} — too risky, skipping")
-            return {"success": False, "error": f"Ask drift too high — best ask {best_ask:.2f} vs signal {price:.2f} (drift {drift:.2f})"}
+        # Log best ask drift for info only — don't block (market orders fill at best available price)
+        if best_ask > 0 and abs(best_ask - price) > 0.15:
+            print(f"[INFO] Best ask {best_ask:.2f} vs signal {price:.2f} (drift {abs(best_ask-price):.2f}) — market order will fill at best price, proceeding")
         
         order_args = MarketOrderArgsV2(
             token_id=token_id,
