@@ -583,12 +583,9 @@ def place_live_order(
         if not has_liq:
             return {"success": False, "error": f"Thin orderbook — not enough asks for ${size_usdc:.2f} (best ask: {best_ask:.2f})"}
         
-        # Reject order if best ask is way off signal price (stale/manipulated orderbook)
-        MAX_ASK_DRIFT = 0.15
-        if best_ask > 0 and abs(best_ask - price) > MAX_ASK_DRIFT:
-            drift = abs(best_ask - price)
-            print(f"[SKIP] Best ask {best_ask:.2f} drifts {drift:.2f} from signal {price:.2f} — too risky, skipping")
-            return {"success": False, "error": f"Ask drift too high — best ask {best_ask:.2f} vs signal {price:.2f} (drift {drift:.2f})"}
+        # Log best ask drift for info only — don't block (market orders fill at best available price)
+        if best_ask > 0 and abs(best_ask - price) > 0.15:
+            print(f"[INFO] Best ask {best_ask:.2f} vs signal {price:.2f} (drift {abs(best_ask-price):.2f}) — market order will fill at best price, proceeding")
         
         order_args = MarketOrderArgsV2(
             token_id=token_id,
@@ -916,10 +913,35 @@ class AutoTrader:
 
         self.current_window: Optional[WindowState] = None
         self._pending_live: List[WindowState] = []  # live trades waiting for Polymarket resolution
-        self.daily_stats = DailyStats(
-            date=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-            peak_bankroll=self.bankroll,
-        )
+
+        # Load today's stats from file if exists (survives restarts)
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        _stats_file = "/tmp/polylock_daily_stats.json"
+        _loaded_stats = None
+        try:
+            import json as _json
+            with open(_stats_file) as _f:
+                _saved = _json.load(_f)
+            if _saved.get("date") == today_str:
+                _loaded_stats = _saved
+                print(f"[STATS] Loaded today's stats: {_saved['trades']} trades, P/L ${_saved['profit']:+.2f}")
+        except Exception:
+            pass
+
+        if _loaded_stats:
+            self.daily_stats = DailyStats(
+                date=today_str,
+                peak_bankroll=_loaded_stats.get("peak_bankroll", self.bankroll),
+                trades=_loaded_stats.get("trades", 0),
+                wins=_loaded_stats.get("wins", 0),
+                losses=_loaded_stats.get("losses", 0),
+                profit=_loaded_stats.get("profit", 0.0),
+            )
+        else:
+            self.daily_stats = DailyStats(
+                date=today_str,
+                peak_bankroll=self.bankroll,
+            )
         self.all_time_trades: List[WindowState] = []
 
         # FIX 1: price history untuk resolve akurat di boundary window
@@ -1040,6 +1062,24 @@ class AutoTrader:
                 self.initial_bankroll = self.bankroll
         except Exception as e:
             print(f"[WARN] SDK balance check: {e}")
+            # Retry once after 5s
+            import time as _time
+            _time.sleep(5)
+            try:
+                bal_data = bal_client.get_balance_allowance(params)
+                raw_balance = float(bal_data.get("balance", 0))
+                actual_balance = raw_balance / 1_000_000 if raw_balance > 1000 else raw_balance
+                if actual_balance > 0:
+                    if self.bankroll <= 0 or actual_balance >= self.bankroll:
+                        self.bankroll = actual_balance
+                    self.initial_bankroll = self.bankroll
+                    print(f"💰 Retry OK: Polymarket pUSD ${actual_balance:,.2f}")
+            except Exception as e2:
+                print(f"[WARN] Retry balance check failed: {e2}")
+                if self.bankroll <= 0:
+                    print(f"⚠️  Bankroll still 0 — defaulting to $10 (set --bankroll to override)")
+                    self.bankroll = 10.0
+                self.initial_bankroll = self.bankroll
             self.initial_bankroll = self.bankroll
     # ── NOTIFY ─────────────────────────────────────────────────────────────
 
@@ -1610,6 +1650,21 @@ class AutoTrader:
         print(msg.replace('*', '').replace('`', ''))
         print(f"{'='*50}\n")
         self._notify(msg)
+
+        # Save daily stats to file (survives restart)
+        try:
+            import json as _json
+            with open("/tmp/polylock_daily_stats.json", "w") as _f:
+                _json.dump({
+                    "date":         self.daily_stats.date,
+                    "trades":       self.daily_stats.trades,
+                    "wins":         self.daily_stats.wins,
+                    "losses":       self.daily_stats.losses,
+                    "profit":       round(self.daily_stats.profit, 4),
+                    "peak_bankroll": round(self.daily_stats.peak_bankroll, 4),
+                }, _f)
+        except Exception as _e:
+            print(f"[WARN] Could not save daily stats: {_e}")
 
         # ── Balance sync — only when NO open positions ──
         has_open = bool(getattr(self, '_pending_live', []))
