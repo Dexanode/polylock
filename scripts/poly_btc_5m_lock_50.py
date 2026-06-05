@@ -45,30 +45,38 @@ MIN_ORDER_USDC       = 1.0        # Polymarket minimum order $1
 BUY_PRICE_BUFFER     = 0.10       # Add to price to cross spread & ensure fill (min $0.10)
 
 def fetch_polymarket_balance(private_key: str, clob_creds: Optional[Dict] = None) -> Optional[float]:
+    """Fetch real Polymarket pUSD balance via CLOB SDK (POLY_1271)."""
     if not clob_creds:
         return None
     try:
-        import hmac, hashlib, base64
-        ts = str(int(time.time() * 1000))
-        message = ts + "GET" + "/balance-allowance" + ""
-        raw_secret = clob_creds["api_secret"]
-        # Auto-pad jika secret belum base64-padded
-        missing_padding = len(raw_secret) % 4
-        if missing_padding:
-            raw_secret += "=" * (4 - missing_padding)
-        secret = base64.b64decode(raw_secret)
-        sig = base64.b64encode(hmac.new(secret, message.encode(), hashlib.sha256).digest()).decode()
-        headers = {"POLY-API-KEY": clob_creds["api_key"], "POLY-TIMESTAMP": ts, "POLY-SIGNATURE": sig, "POLY-PASSPHRASE": clob_creds["api_passphrase"]}
-        req = urllib.request.Request(f"{CLOB_HOST}/balance-allowance", headers=headers)
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            data = json.loads(resp.read())
-        # V2 returns {"balance": x, "allowance": y} or just {"balance": x}
-        balance = float(data.get("balance", 0))
-        allowance = float(data.get("allowance", 0))
-        print(f"[BALANCE] Polymarket: ${balance:,.2f} (allowance: ${allowance:,.2f})")
-        return balance if balance > 0 else allowance
+        _patch_httpx_proxy()
+        from py_clob_client_v2 import ClobClient, ApiCreds, SignatureTypeV2
+        from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
+        from py_clob_client_v2.constants import POLYGON
+
+        api = ApiCreds(
+            api_key=clob_creds["api_key"],
+            api_secret=clob_creds["api_secret"],
+            api_passphrase=clob_creds["api_passphrase"],
+        )
+        funder = compute_deposit_wallet_address(
+            __import__('web3').Web3().eth.account.from_key(private_key).address
+        )
+        client = ClobClient(
+            host=CLOB_HOST, chain_id=POLYGON,
+            key=private_key, creds=api,
+            signature_type=SignatureTypeV2.POLY_1271,
+            funder=funder,
+        )
+        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        bal_data = client.get_balance_allowance(params)
+        raw = float(bal_data.get("balance", 0))
+        balance = raw / 1_000_000 if raw > 1000 else raw
+        print(f"[BALANCE] Polymarket: ${balance:,.2f}")
+        return balance
     except Exception as e:
         print(f"[WARN] Polymarket balance: {e}")
+        return None
         return None
 
 def fetch_usdc_balance(wallet_address: str) -> float:
@@ -487,6 +495,23 @@ def check_order_fill(client, order_id: str) -> Optional[float]:
         return None
 
 
+def check_liquidity(client, token_id: str) -> bool:
+    """Check if token has an active order book with sell orders.
+    Returns True if there's at least one ask (can buy), False if empty."""
+    try:
+        book = client.get_order_book(token_id)
+        if not isinstance(book, dict):
+            return False
+        asks = book.get("asks", [])
+        return len(asks) > 0
+    except Exception as e:
+        err = str(e)
+        if "404" in err or "No orderbook" in err:
+            return False  # No order book at all
+        print(f"[LIQUIDITY] Check error: {err[:100]}")
+        return False  # Assume no liquidity on error
+
+
 def place_live_order(
     private_key: str,
     creds: Dict,
@@ -522,6 +547,10 @@ def place_live_order(
         )
 
         print(f"[MARKET ORDER] ${size_usdc:.2f} USDC → {token_id[:15]}...")
+        
+        # Pre-check: skip if no order book (zero liquidity)
+        if not check_liquidity(client, token_id):
+            return {"success": False, "error": "Zero liquidity — no order book for this market"}
         
         order_args = MarketOrderArgsV2(
             token_id=token_id,
@@ -567,8 +596,8 @@ def place_live_order(
 
     except Exception as e:
         err = str(e)
-        if "couldn't be fully filled" in err or "FOK" in err:
-            return {"success": False, "error": f"No liquidity at market — zero sell orders"}
+        if "couldn't be fully filled" in err or "FOK" in err or "no match" in err.lower():
+            return {"success": False, "error": f"Zero liquidity — no sell orders at any price near {price:.2f}"}
         elif "not enough" in err.lower() or "insufficient" in err.lower():
             return {"success": False, "error": "Insufficient pUSD in deposit wallet"}
         elif "timeout" in err.lower() or "timed out" in err.lower():
@@ -1066,7 +1095,7 @@ class AutoTrader:
             # Kalau signal UP tapi UP sudah >0.85 = market terlalu mahal, skip
             # Kalau signal DOWN tapi DOWN sudah <0.30 = market pricing DOWN unlikely, skip
             MIN_PRICE = 0.30   # harga terlalu murah = market tidak percaya direction ini
-            MAX_PRICE = 0.97   # harga terlalu mahal = profit terlalu kecil
+            MAX_PRICE = 0.85   # di atas ini profit terlalu tipis + zero liquidity risk
             if real_price > 0:
                 if real_price < MIN_PRICE:
                     msg_skip = (
@@ -1200,30 +1229,31 @@ class AutoTrader:
 
     def _check_polymarket_resolution(self, window: WindowState) -> Optional[bool]:
         """Check actual Polymarket market resolution for a live trade.
-        Returns True if trade won, False if lost, None if still unresolved."""
+        Returns True if trade won, False if lost, None if still unresolved.
+        Uses outcomePrices field: ["1","0"] = YES/UP won, ["0","1"] = NO/DOWN won."""
         try:
             ts = int(window.start.timestamp())
             slug = f"btc-updown-5m-{ts}"
-            # Gamma API uses query param, returns array
-            url = f"{GAMMA_HOST}/markets?slug={slug}"
+            # CORRECT endpoint: /markets/slug/{slug} (NOT /markets?slug=)
+            url = f"{GAMMA_HOST}/markets/slug/{slug}"
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=10) as resp:
-                markets = json.loads(resp.read())
-            
-            if not markets or not isinstance(markets, list):
-                return None
-            data = markets[0]
+                data = json.loads(resp.read())
+
+            if not data or not data.get("conditionId"):
+                return None  # Market not found yet
 
             closed = data.get("closed", False)
-            outcome = data.get("outcome", "")  # "Yes" or "No"
+            outcome_prices = data.get("outcomePrices", [])
 
-            if not closed or not outcome:
-                return None  # Still pending
+            if not closed or not outcome_prices or len(outcome_prices) < 2:
+                return None  # Still pending resolution
 
-            # "Yes" = UP token won, "No" = DOWN token won
-            yes_won = (outcome.lower() == "yes")
+            # outcomePrices[0] = YES/UP token payout, outcomePrices[1] = NO/DOWN token payout
+            # e.g. ["1","0"] = UP won, ["0","1"] = DOWN won
+            up_won = (str(outcome_prices[0]) == "1")
 
-            if yes_won:
+            if up_won:
                 return window.direction == Direction.UP
             else:
                 return window.direction == Direction.DOWN
@@ -1254,19 +1284,19 @@ class AutoTrader:
             log_window(window)
             return
 
-        # ── LIVE ORDER: Polymarket API, fallback to Chainlink ──────
+        # ── LIVE ORDER: Polymarket API resolution ──────────────────
         if window._is_live and window._order_id:
-            # Market orders always fill immediately — no GTC pending check needed
             pm_won = self._check_polymarket_resolution(window)
             if pm_won is not None:
-                won = pm_won  # Use Polymarket resolution
+                won = pm_won  # ✅ Use Polymarket resolution
             else:
-                # Fallback: Chainlink boundary price (same oracle Polymarket uses)
-                won = (
-                    (window.direction == Direction.DOWN and window.final_spread < 0) or
-                    (window.direction == Direction.UP   and window.final_spread > 0)
-                )
-                print(f"[RESOLVE] Polymarket API unavailable — using Chainlink (same oracle)")
+                # ⚠️ API not available yet — defer resolution, do NOT fallback to Chainlink!
+                print(f"[RESOLVE] Market {window.start.strftime('%H:%M')} not yet resolved on Polymarket — deferring")
+                window.result = "PENDING"
+                log_window(window)
+                if window not in self._pending_live:
+                    self._pending_live.append(window)
+                return
         else:
             # Paper / fallback: use Chainlink boundary price
             won = (
@@ -1317,6 +1347,23 @@ class AutoTrader:
         print(msg.replace('*', '').replace('`', ''))
         print(f"{'='*50}\n")
         self._notify(msg)
+
+        # ── Periodic balance sync (every 3 windows or every win) ──
+        self._balance_sync_count = getattr(self, '_balance_sync_count', 0) + 1
+        if self.mode == Mode.LIVE and self._balance_sync_count >= 3 and self.clob_creds:
+            real = fetch_polymarket_balance(self._private_key, self.clob_creds)
+            if real and real > 0:
+                old_bankroll = self.bankroll
+                diff = real - old_bankroll
+                if abs(diff) > 0.05:  # Only sync if difference > 5 cents
+                    print(f"[SYNC] Bankroll drift: ${old_bankroll:.2f} → ${real:.2f} (Δ={diff:+.2f})")
+                    self.bankroll = real
+                    self._balance_sync_count = 0
+                    self._notify(
+                        f"🔄 <b>BALANCE SYNC</b>\n"
+                        f"Bot: <code>${old_bankroll:.2f}</code> → Real: <code>${real:.2f}</code>\n"
+                        f"Drift: <code>{diff:+.2f}</code>"
+                    )
         # Persist hasil final ke file — overwrite baris PENDING
         log_window(window)
         log_stats(self.daily_stats, self.bankroll, self.mode.value)
@@ -1359,6 +1406,33 @@ class AutoTrader:
                 if self.current_window:
                     self._resolve_window(self.current_window, btc_price)
                     self.all_time_trades.append(self.current_window)
+
+                # ── Retry pending live resolutions ────────────────────
+                if self._pending_live:
+                    resolved_now = []
+                    now_ts = time.time()
+                    for pw in self._pending_live:
+                        # Try to resolve from Polymarket
+                        result = self._check_polymarket_resolution(pw)
+                        if result is not None:
+                            pw.final_spread = btc_price - pw.ptb
+                            self._finalize_window_result(pw, result)
+                            self.all_time_trades.append(pw)
+                            resolved_now.append(pw)
+                            print(f"[PENDING] Resolved deferred window {pw.start.strftime('%H:%M')}: {'WIN ✅' if result else 'LOSS ❌'}")
+                        # Force resolve if >30min pending (stale)
+                        elif (now_ts - pw.start.timestamp()) > 1800:
+                            pw.final_spread = btc_price - pw.ptb
+                            fallback_result = (
+                                (pw.direction == Direction.DOWN and pw.final_spread < 0) or
+                                (pw.direction == Direction.UP and pw.final_spread > 0)
+                            )
+                            self._finalize_window_result(pw, fallback_result)
+                            self.all_time_trades.append(pw)
+                            resolved_now.append(pw)
+                            print(f"[PENDING] Stale trade {pw.start.strftime('%H:%M')} — force resolved (Chainlink): {'WIN ✅' if fallback_result else 'LOSS ❌'}")
+                    for pw in resolved_now:
+                        self._pending_live.remove(pw)
 
                 ptb = btc_price
                 if seconds_into > 5:
