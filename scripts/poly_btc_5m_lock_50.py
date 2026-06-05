@@ -494,10 +494,9 @@ def place_live_order(
     size_usdc: float,
     price: float,
     funder: str = None,
-) -> Optional[Dict]:
+) -> Dict:
     """Place live order via CLOB V2 with POLY_1271 + deposit wallet.
-    Returns dict with order details on success, None on failure.
-    GTC orders are left open — fill check happens in _resolve_window."""
+    Returns {"success": True, ...} or {"success": False, "error": "reason"}"""
     try:
         _patch_httpx_proxy()
         from py_clob_client_v2 import ClobClient, ApiCreds, OrderArgs, OrderType, SignatureTypeV2
@@ -539,7 +538,7 @@ def place_live_order(
         resp = client.create_and_post_order(order_args, order_type=OrderType.GTC)
 
         if not resp:
-            return None
+            return {"success": False, "error": "CLOB API empty response — network issue?"}
 
         status = resp.get("status", "?")
         order_id = resp.get("orderID") or resp.get("id", "?")
@@ -551,6 +550,7 @@ def place_live_order(
             fill_shares = filled if (filled and filled > 0) else shares
             print(f"✅ Instantly MATCHED! Filled: {fill_shares:.1f} shares")
             return {
+                "success": True,
                 "order_id": order_id, "status": "matched",
                 "shares": fill_shares, "price": price,
                 "cost": fill_shares * price, "token_id": token_id,
@@ -558,27 +558,29 @@ def place_live_order(
 
         elif status in ("live", "unmatched") or resp.get("success"):
             # GTC order placed — leave it open to fill over time
-            print(f"✅ GTC order LIVE — waiting for match (could take minutes)")
+            print(f"✅ GTC order LIVE — waiting for match")
             return {
+                "success": True,
                 "order_id": order_id, "status": "live",
                 "shares": shares, "price": price,
                 "cost": shares * price, "token_id": token_id,
             }
 
         else:
-            print(f"[ERROR] {resp.get('errorMsg', str(resp))}")
-            return None
+            err_msg = resp.get("errorMsg", str(resp))
+            print(f"[ERROR] {err_msg}")
+            return {"success": False, "error": f"CLOB rejected: {err_msg[:150]}"}
 
     except Exception as e:
         err = str(e)
         if "couldn't be fully filled" in err or "FOK" in err:
-            print(f"[LIVE] No match at {price}")
-            return None
+            return {"success": False, "error": f"No sell orders at ${price:.2f} — zero liquidity"}
         elif "not enough" in err.lower() or "insufficient" in err.lower():
-            print(f"[LIVE] Insufficient balance")
-            return None
+            return {"success": False, "error": "Insufficient pUSD in deposit wallet"}
+        elif "timeout" in err.lower() or "timed out" in err.lower():
+            return {"success": False, "error": "Polymarket API timeout — retry next window"}
         print(f"[LIVE ERROR] {err[:200]}")
-        return None
+        return {"success": False, "error": f"API error: {err[:120]}"}
 
 
 # ---------------------------------------------------------------------------
@@ -1134,7 +1136,7 @@ class AutoTrader:
                     print(f"[LIVE ORDER] Token: {token[:20]}... | {direction.value}")
                     print(f"[LIVE ORDER] Bet: ${bet_usdc:.2f} | Signal: {actual_price:.2f} → Limit: {order_price:.2f}")
                     order_result = place_live_order(self._private_key, self.clob_creds, token, bet_usdc, order_price, self.deposit_wallet)
-                    if order_result:
+                    if order_result.get("success"):
                         # ✅ TRACK WITH REAL ORDER NUMBERS (signal price, not limit price)
                         real_status = order_result["status"]
                         real_shares = order_result["shares"]
@@ -1170,9 +1172,16 @@ class AutoTrader:
                             send_telegram(msg_live, self.telegram_token, self.chat_id)
                         print("[LIVE ORDER] ✅ Order submitted!")
                     else:
+                        error_reason = order_result.get("error", "Unknown error")
                         if self.telegram_token and self.chat_id:
-                            send_telegram(f"❌ <b>AUTO-TRADE FAILED</b>\n{action} @ {actual_price:.2f} | ${bet_usdc:.2f} USDC", self.telegram_token, self.chat_id)
-                        print("[LIVE ORDER] ❌ FAILED — order not placed, bankroll unchanged")
+                            send_telegram(
+                                f"❌ <b>AUTO-TRADE FAILED</b>\n"
+                                f"Action: <b>{action}</b> @ <code>{actual_price:.2f}</code>\n"
+                                f"Bet: <code>${bet_usdc:.2f} USDC</code>\n"
+                                f"Reason: <i>{error_reason}</i>",
+                                self.telegram_token, self.chat_id
+                            )
+                        print(f"[LIVE ORDER] ❌ FAILED — {error_reason}")
                         return False  # ← Don't track failed orders!
                 else:
                     print("[LIVE ORDER] ❌ Token not found")
