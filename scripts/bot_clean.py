@@ -1018,9 +1018,15 @@ class AutoTrader:
             actual_balance = raw_balance / 1_000_000 if raw_balance > 1000 else raw_balance
             
             if actual_balance > 0:
-                print(f"💰 Polymarket pUSD: ${actual_balance:,.2f} — bankroll updated")
-                self.bankroll = actual_balance
-                self.initial_bankroll = actual_balance
+                # Use max of real balance and --bankroll to avoid undercount
+                # when there are open positions (cash is locked in trades)
+                if actual_balance < self.bankroll:
+                    print(f"💰 Polymarket pUSD: ${actual_balance:,.2f} — lower than --bankroll ${self.bankroll:.2f} (open positions?)")
+                    print(f"    Keeping --bankroll ${self.bankroll:.2f} to account for locked funds")
+                else:
+                    print(f"💰 Polymarket pUSD: ${actual_balance:,.2f} — bankroll updated")
+                    self.bankroll = actual_balance
+                self.initial_bankroll = self.bankroll
             else:
                 print(f"⚠️  No balance on deposit wallet — using --bankroll ${self.bankroll:.2f}")
                 self.initial_bankroll = self.bankroll
