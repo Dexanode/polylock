@@ -465,8 +465,9 @@ def place_live_order(
     size_usdc: float,
     price: float,
     funder: str = None,
-) -> bool:
-    """Place live order via CLOB V2 with POLY_1271 + deposit wallet."""
+) -> Optional[Dict]:
+    """Place live order via CLOB V2 with POLY_1271 + deposit wallet.
+    Returns dict with order details on success, None on failure."""
     try:
         _patch_httpx_proxy()
         from py_clob_client_v2 import ClobClient, ApiCreds, OrderArgs, OrderType, SignatureTypeV2
@@ -492,6 +493,7 @@ def place_live_order(
 
         # Fix: size = shares (bukan USDC). Min 5 shares.
         shares = max(5.0, size_usdc / price) if price > 0 else 5.0
+        actual_cost = shares * price
 
         order_args = OrderArgs(
             token_id=token_id,
@@ -510,24 +512,38 @@ def place_live_order(
             print(f"[LIVE] ID: {order_id} | Status: {status}")
             if status in ("matched", "live") or resp.get("success"):
                 print(f"✅ Order placed! ID: {order_id}")
-                return True
+                return {
+                    "order_id": order_id,
+                    "status": status,
+                    "shares": shares,
+                    "price": price,
+                    "cost": actual_cost,
+                    "token_id": token_id,
+                }
             elif status == "unmatched":
                 print(f"[LIVE] GTC order live, waiting for match...")
-                return True  # GTC stays open, still success
+                return {
+                    "order_id": order_id,
+                    "status": status,
+                    "shares": shares,
+                    "price": price,
+                    "cost": actual_cost,
+                    "token_id": token_id,
+                }
             else:
                 print(f"[ERROR] {resp.get('errorMsg', str(resp))}")
-                return False
-        return False
+                return None
+        return None
     except Exception as e:
         err = str(e)
         if "couldn't be fully filled" in err or "FOK" in err:
             print(f"[LIVE] No match at {price} — try higher price")
-            return False
+            return None
         elif "not enough" in err.lower() or "insufficient" in err.lower():
             print(f"[LIVE] Insufficient balance")
-            return False
+            return None
         print(f"[LIVE ERROR] {err[:200]}")
-        return False
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -553,6 +569,12 @@ class WindowState:
     final_spread:    float     = 0.0
     result:          str       = ""
     filter_attempts: int       = 0       # how many times filters were checked
+    # Live order tracking (CLOB V2)
+    _order_id:       str       = ""       # Polymarket order ID
+    _is_live:        bool      = False    # True if real order placed
+    _actual_price:   float     = 0.0      # REAL entry price from live order
+    _actual_shares:  float     = 0.0      # REAL shares from live order
+    _actual_cost:    float     = 0.0      # REAL cost deducted
 
 @dataclass
 class DailyStats:
@@ -794,6 +816,7 @@ class AutoTrader:
         self.max_trades_per_day = args.max_trades
 
         self.current_window: Optional[WindowState] = None
+        self._pending_live: List[WindowState] = []  # live trades waiting for Polymarket resolution
         self.daily_stats = DailyStats(
             date=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
             peak_bankroll=self.bankroll,
@@ -1071,18 +1094,38 @@ class AutoTrader:
                 if token:
                     print(f"[LIVE ORDER] Token: {token[:20]}... | {direction.value}")
                     print(f"[LIVE ORDER] Bet: ${bet_usdc:.2f} @ {actual_price:.2f}")
-                    success = place_live_order(self._private_key, self.clob_creds, token, bet_usdc, actual_price, self.deposit_wallet)
-                    if success:
-                        msg_live = f"🤖 <b>AUTO-TRADE EXECUTED</b>\nAction  : <b>{action}</b>\nAmount  : <code>${bet_usdc:.2f} USDC</code>\nPrice   : <code>{actual_price:.2f}</code>\n<a href=\"{market_url}\">🔗 Buka Market</a>"
+                    order_result = place_live_order(self._private_key, self.clob_creds, token, bet_usdc, actual_price, self.deposit_wallet)
+                    if order_result:
+                        # ✅ TRACK WITH REAL ORDER NUMBERS
+                        real_shares = order_result["shares"]
+                        real_cost = order_result["cost"]
+                        window._order_id = order_result["order_id"]
+                        window._is_live = True
+                        window._actual_price = actual_price
+                        window._actual_shares = real_shares
+                        window._actual_cost = real_cost
+                        window.entry_price = actual_price  # ← REAL price
+                        window.size = real_shares          # ← REAL shares
+
+                        msg_live = (
+                            f"🤖 <b>AUTO-TRADE EXECUTED</b>\n"
+                            f"Action  : <b>{action}</b>\n"
+                            f"Amount  : <code>${real_cost:.2f} USDC</code>\n"
+                            f"Shares  : <code>{real_shares:.1f}</code> @ <code>{actual_price:.2f}</code>\n"
+                            f"ID  : <code>{order_result['order_id'][:20]}...</code>\n"
+                            f"<a href=\"{market_url}\">🔗 Buka Market</a>"
+                        )
                         if self.telegram_token and self.chat_id:
                             send_telegram(msg_live, self.telegram_token, self.chat_id)
                         print("[LIVE ORDER] ✅ Order submitted!")
                     else:
                         if self.telegram_token and self.chat_id:
                             send_telegram(f"❌ <b>AUTO-TRADE FAILED</b>\n{action} @ {actual_price:.2f} | ${bet_usdc:.2f} USDC", self.telegram_token, self.chat_id)
-                        print("[LIVE ORDER] ❌ FAILED")
+                        print("[LIVE ORDER] ❌ FAILED — order not placed, bankroll unchanged")
+                        return False  # ← Don't track failed orders!
                 else:
                     print("[LIVE ORDER] ❌ Token not found")
+                    return False
 
         # ── PAPER / Record ─────────────────────────────────────────────────
         else:
@@ -1090,13 +1133,15 @@ class AutoTrader:
             print(f"[PAPER TRADE] BUY {size} shares @ {entry_price:.2f}")
             print(f"  Direction: {direction.value} | Cost: ${total_cost:.2f} | Fee: ${fee:.2f}")
             print(f"{'='*50}\n")
+            window.entry_price = entry_price
+            window.size = size
 
         window.traded      = True
         window.direction   = direction
-        window.entry_price = entry_price
-        window.size        = size
         self.daily_stats.trades += 1
-        self.bankroll -= total_cost
+        # Deduct real cost for live, estimated for paper
+        deduct = window._actual_cost if window._is_live else total_cost
+        self.bankroll -= deduct
         print(f"[TRADE] Bankroll: ${self.bankroll:.2f}")
         window.result = "PENDING"
         log_window(window)
@@ -1104,6 +1149,38 @@ class AutoTrader:
         return True
 
     # ── FIX 1: RESOLVE WITH BOUNDARY PRICE ─────────────────────────────────
+
+    def _check_polymarket_resolution(self, window: WindowState) -> Optional[bool]:
+        """Check actual Polymarket market resolution for a live trade.
+        Returns True if trade won, False if lost, None if still unresolved."""
+        try:
+            ts = int(window.start.timestamp())
+            slug = f"btc-updown-5m-{ts}"
+            url = f"{GAMMA_HOST}/markets/{slug}"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+
+            closed = data.get("closed", False)
+            outcome = data.get("outcome", "")  # "Yes" or "No"
+
+            if not closed or not outcome:
+                return None  # Still pending
+
+            # "Yes" = UP token won, "No" = DOWN token won
+            yes_won = (outcome.lower() == "yes")
+
+            if yes_won:
+                return window.direction == Direction.UP
+            else:
+                return window.direction == Direction.DOWN
+
+        except Exception as e:
+            # 404 = market not found / slug format wrong
+            if "404" in str(e) or "not found" in str(e).lower():
+                return None
+            print(f"[RESOLVE] API check error: {e}")
+            return None
 
     def _resolve_window(self, window: WindowState, fallback_price: float):
         # Cari harga closest ke detik :00 dari window berikutnya
@@ -1124,12 +1201,35 @@ class AutoTrader:
             log_window(window)
             return
 
-        won = (
-            (window.direction == Direction.DOWN and window.final_spread < 0) or
-            (window.direction == Direction.UP   and window.final_spread > 0)
-        )
+        # ── LIVE ORDER: check Polymarket directly ──────────────────────
+        if window._is_live and window._order_id:
+            # Wait up to 60s for Polymarket to resolve, polling every 10s
+            for attempt in range(6):
+                if attempt > 0:
+                    time.sleep(10)
+                won = self._check_polymarket_resolution(window)
+                if won is not None:
+                    break
+            if won is None:
+                # Still unresolved after 60s — defer to pending list
+                print(f"[RESOLVE] Live order {window._order_id[:15]}... still unresolved after 60s — deferring")
+                window.result = "PENDING"
+                log_window(window)
+                self._pending_live.append(window)
+                return
+        else:
+            # Paper / fallback: use Chainlink boundary price
+            won = (
+                (window.direction == Direction.DOWN and window.final_spread < 0) or
+                (window.direction == Direction.UP   and window.final_spread > 0)
+            )
 
-        cost       = window.size * window.entry_price
+        self._finalize_window_result(window, won, boundary_price)
+
+    def _finalize_window_result(self, window: WindowState, won: bool, boundary_price: float = 0.0):
+        """Apply win/loss to bankroll and log results."""
+        # Use REAL numbers for live trades, estimated for paper
+        cost       = window._actual_cost if window._is_live else window.size * window.entry_price
         fee        = cost * FEE_RATE
         total_cost = cost + fee
 
@@ -1140,8 +1240,9 @@ class AutoTrader:
             self.daily_stats.profit += profit
             self.bankroll           += payout
             window.result = "WIN"
+            source_tag = "[Polymarket]" if window._is_live else ""
             msg = (
-                f"✅ *LOCK WIN* 🎉\n"
+                f"✅ *LOCK WIN* 🎉 {source_tag}\n"
                 f"Window: `{window.start.strftime('%H:%M:%S')}` | Dir: *{window.direction.value}*\n"
                 f"PTB: `${window.ptb:,.2f}` → Final: `${boundary_price:,.2f}`\n"
                 f"Entry: `{window.entry_price:.2f}` | Size: `{window.size}` shares\n"
@@ -1152,8 +1253,9 @@ class AutoTrader:
             self.daily_stats.losses += 1
             self.daily_stats.profit -= loss
             window.result = "LOSS"
+            source_tag = "[Polymarket]" if window._is_live else ""
             msg = (
-                f"❌ *LOCK LOSS*\n"
+                f"❌ *LOCK LOSS* {source_tag}\n"
                 f"Window: `{window.start.strftime('%H:%M:%S')}` | Dir: *{window.direction.value}*\n"
                 f"PTB: `${window.ptb:,.2f}` → Final: `${boundary_price:,.2f}`\n"
                 f"Entry: `{window.entry_price:.2f}` | Size: `{window.size}` shares\n"
@@ -1202,11 +1304,28 @@ class AutoTrader:
             window_start  = get_window_start(now)
             seconds_into  = (now - window_start).total_seconds()
 
+            # ── Retry pending live trades from previous cycles ─────────
+            if self._pending_live:
+                resolved_now = []
+                for pw in self._pending_live:
+                    result = self._check_polymarket_resolution(pw)
+                    if result is not None:
+                        # Polymarket resolved — finalize
+                        pw.final_spread = btc_price - pw.ptb
+                        self._finalize_window_result(pw, result)
+                        resolved_now.append(pw)
+                for pw in resolved_now:
+                    self._pending_live.remove(pw)
+                    self.all_time_trades.append(pw)
+
             # ── New window ─────────────────────────────────────────────────
             if self.current_window is None or self.current_window.start != window_start:
                 if self.current_window:
-                    self._resolve_window(self.current_window, btc_price)
-                    self.all_time_trades.append(self.current_window)
+                    # Don't resolve if already in pending_live (handled above)
+                    if self.current_window not in self._pending_live:
+                        self._resolve_window(self.current_window, btc_price)
+                    if self.current_window not in self._pending_live:
+                        self.all_time_trades.append(self.current_window)
 
                 ptb = btc_price
                 if seconds_into > 5:
