@@ -42,6 +42,7 @@ ALERT_WINDOW_START   = 3 * 60 + 30  # 210s — start of LOCK zone (lebih awal, b
 ALERT_WINDOW_END     = 4 * 60 + 20  # 260s — end of LOCK zone (stop 40s sebelum close)
 FEE_RATE             = 0.02       # Polymarket taker fee
 MIN_ORDER_USDC       = 1.0        # Polymarket minimum order $1
+BUY_PRICE_BUFFER     = 0.06       # Add to price to cross spread & ensure fill
 
 def fetch_polymarket_balance(private_key: str, clob_creds: Optional[Dict] = None) -> Optional[float]:
     if not clob_creds:
@@ -1140,26 +1141,28 @@ class AutoTrader:
                 self.yes_token, self.no_token = fetch_btc_5m_market_tokens(window.start)
                 token = self.yes_token if direction == Direction.UP else self.no_token
                 if token:
+                    # Apply price buffer to cross spread (limit order at higher price = guaranteed fill)
+                    order_price = min(actual_price + BUY_PRICE_BUFFER, 0.99)
                     print(f"[LIVE ORDER] Token: {token[:20]}... | {direction.value}")
-                    print(f"[LIVE ORDER] Bet: ${bet_usdc:.2f} @ {actual_price:.2f}")
-                    order_result = place_live_order(self._private_key, self.clob_creds, token, bet_usdc, actual_price, self.deposit_wallet)
+                    print(f"[LIVE ORDER] Bet: ${bet_usdc:.2f} | Signal: {actual_price:.2f} → Limit: {order_price:.2f}")
+                    order_result = place_live_order(self._private_key, self.clob_creds, token, bet_usdc, order_price, self.deposit_wallet)
                     if order_result:
-                        # ✅ TRACK WITH REAL ORDER NUMBERS
+                        # ✅ TRACK WITH REAL ORDER NUMBERS (signal price, not limit price)
                         real_shares = order_result["shares"]
                         real_cost = order_result["cost"]
                         window._order_id = order_result["order_id"]
                         window._is_live = True
-                        window._actual_price = actual_price
+                        window._actual_price = actual_price  # Signal price (conservative)
                         window._actual_shares = real_shares
                         window._actual_cost = real_cost
-                        window.entry_price = actual_price  # ← REAL price
-                        window.size = real_shares          # ← REAL shares
+                        window.entry_price = actual_price
+                        window.size = real_shares
 
                         msg_live = (
                             f"🤖 <b>AUTO-TRADE EXECUTED</b>\n"
                             f"Action  : <b>{action}</b>\n"
                             f"Amount  : <code>${real_cost:.2f} USDC</code>\n"
-                            f"Shares  : <code>{real_shares:.1f}</code> @ <code>{actual_price:.2f}</code>\n"
+                            f"Shares  : <code>{real_shares:.1f}</code> | Limit <code>{order_price:.2f}</code>\n"
                             f"ID  : <code>{order_result['order_id'][:20]}...</code>\n"
                             f"<a href=\"{market_url}\">🔗 Buka Market</a>"
                         )
