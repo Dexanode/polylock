@@ -458,6 +458,34 @@ def _patch_httpx_proxy():
         print(f"[WARN] proxy patch failed: {e}")
 
 
+def cancel_all_clob_orders(client) -> int:
+    """Cancel all open orders on CLOB. Returns number cancelled."""
+    try:
+        resp = client.cancel_all()
+        cancelled = resp.get("cancelled", []) if isinstance(resp, dict) else []
+        count = len(cancelled) if isinstance(cancelled, list) else 0
+        if count > 0:
+            print(f"[CANCEL] Cancelled {count} stale orders")
+        return count
+    except Exception as e:
+        print(f"[CANCEL] Error: {e}")
+        return 0
+
+
+def check_order_fill(client, order_id: str) -> Optional[float]:
+    """Check how many shares of an order have been filled.
+    Returns filled_amount (in shares) or None if order not found."""
+    try:
+        resp = client.get_order(order_id)
+        if not resp:
+            return None
+        filled = float(resp.get("filled", 0) or resp.get("filled_size", 0) or resp.get("filledAmount", 0) or 0)
+        return filled
+    except Exception as e:
+        print(f"[CHECK] Order {order_id[:15]}... error: {e}")
+        return None
+
+
 def place_live_order(
     private_key: str,
     creds: Dict,
@@ -467,7 +495,8 @@ def place_live_order(
     funder: str = None,
 ) -> Optional[Dict]:
     """Place live order via CLOB V2 with POLY_1271 + deposit wallet.
-    Returns dict with order details on success, None on failure."""
+    Returns dict with order details on success, None on failure.
+    For GTC orders: verifies fill before returning success — auto-cancels unfilled."""
     try:
         _patch_httpx_proxy()
         from py_clob_client_v2 import ClobClient, ApiCreds, OrderArgs, OrderType, SignatureTypeV2
@@ -491,9 +520,11 @@ def place_live_order(
             funder=funder,
         )
 
+        # Cancel stale orders first (from previous windows)
+        cancel_all_clob_orders(client)
+
         # Fix: size = shares (bukan USDC). Min 5 shares.
         shares = max(5.0, size_usdc / price) if price > 0 else 5.0
-        actual_cost = shares * price
 
         order_args = OrderArgs(
             token_id=token_id,
@@ -506,38 +537,55 @@ def place_live_order(
         print(f"[LIVE] ${size_usdc:.2f} USDC = {shares:.1f} shares @ {price:.2f} | {token_id[:15]}...")
         resp = client.create_and_post_order(order_args, order_type=OrderType.GTC)
 
-        if resp:
-            status = resp.get("status", "?")
-            order_id = resp.get("orderID") or resp.get("id", "?")
-            print(f"[LIVE] ID: {order_id} | Status: {status}")
-            if status in ("matched", "live") or resp.get("success"):
-                print(f"✅ Order placed! ID: {order_id}")
-                return {
-                    "order_id": order_id,
-                    "status": status,
-                    "shares": shares,
-                    "price": price,
-                    "cost": actual_cost,
-                    "token_id": token_id,
-                }
-            elif status == "unmatched":
-                print(f"[LIVE] GTC order live, waiting for match...")
-                return {
-                    "order_id": order_id,
-                    "status": status,
-                    "shares": shares,
-                    "price": price,
-                    "cost": actual_cost,
-                    "token_id": token_id,
-                }
-            else:
-                print(f"[ERROR] {resp.get('errorMsg', str(resp))}")
-                return None
-        return None
+        if not resp:
+            return None
+
+        status = resp.get("status", "?")
+        order_id = resp.get("orderID") or resp.get("id", "?")
+        print(f"[LIVE] ID: {order_id} | Status: {status}")
+
+        if status == "matched":
+            # Immediately matched — verify fill amount
+            filled = check_order_fill(client, order_id)
+            fill_shares = filled if (filled and filled > 0) else shares
+            print(f"✅ Instantly matched! Filled: {fill_shares:.1f} shares")
+            return {
+                "order_id": order_id, "status": "matched",
+                "shares": fill_shares, "price": price,
+                "cost": fill_shares * price, "token_id": token_id,
+            }
+
+        elif status in ("live", "unmatched") or resp.get("success"):
+            # GTC placed — poll for fill (max 15s, checking every 5s)
+            print(f"⌛ GTC order live — polling for fill...")
+            for attempt in range(3):
+                time.sleep(5)
+                filled = check_order_fill(client, order_id)
+                if filled is not None and filled > 0:
+                    print(f"✅ Filled after {5*(attempt+1)}s: {filled:.1f} shares")
+                    return {
+                        "order_id": order_id, "status": "filled",
+                        "shares": filled, "price": price,
+                        "cost": filled * price, "token_id": token_id,
+                    }
+
+            # Still unfilled after 15s — CANCEL order
+            print(f"⚠️ No fill after 15s → cancelling order")
+            try:
+                client.cancel(order_id)
+            except Exception:
+                pass
+            cancel_all_clob_orders(client)
+            return None
+
+        else:
+            print(f"[ERROR] {resp.get('errorMsg', str(resp))}")
+            return None
+
     except Exception as e:
         err = str(e)
         if "couldn't be fully filled" in err or "FOK" in err:
-            print(f"[LIVE] No match at {price} — try higher price")
+            print(f"[LIVE] No match at {price}")
             return None
         elif "not enough" in err.lower() or "insufficient" in err.lower():
             print(f"[LIVE] Insufficient balance")
