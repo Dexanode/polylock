@@ -1021,17 +1021,22 @@ class AutoTrader:
             actual_balance = raw_balance / 1_000_000 if raw_balance > 1000 else raw_balance
             
             if actual_balance > 0:
-                # Use max of real balance and --bankroll to avoid undercount
-                # when there are open positions (cash is locked in trades)
-                if actual_balance < self.bankroll:
-                    print(f"💰 Polymarket pUSD: ${actual_balance:,.2f} — lower than --bankroll ${self.bankroll:.2f} (open positions?)")
-                    print(f"    Keeping --bankroll ${self.bankroll:.2f} to account for locked funds")
+                if self.bankroll > 0 and actual_balance < self.bankroll:
+                    # --bankroll explicitly set and real balance is lower
+                    # Likely open positions locking funds — use --bankroll as floor
+                    print(f"💰 Polymarket pUSD: ${actual_balance:,.2f} (open positions may lock funds)")
+                    print(f"    Using --bankroll ${self.bankroll:.2f} as floor")
                 else:
-                    print(f"💰 Polymarket pUSD: ${actual_balance:,.2f} — bankroll updated")
+                    # Default: always trust real Polymarket balance
+                    print(f"💰 Polymarket pUSD: ${actual_balance:,.2f} — bankroll set")
                     self.bankroll = actual_balance
                 self.initial_bankroll = self.bankroll
             else:
-                print(f"⚠️  No balance on deposit wallet — using --bankroll ${self.bankroll:.2f}")
+                if self.bankroll <= 0:
+                    print(f"⚠️  No balance found and no --bankroll set — defaulting to $10")
+                    self.bankroll = 10.0
+                else:
+                    print(f"⚠️  No balance on deposit wallet — using --bankroll ${self.bankroll:.2f}")
                 self.initial_bankroll = self.bankroll
         except Exception as e:
             print(f"[WARN] SDK balance check: {e}")
@@ -1792,7 +1797,7 @@ def main():
     parser.add_argument("--telegram-token", default="",         help="Telegram Bot Token")
     parser.add_argument("--chat-id",        default="",         help="Telegram Chat ID")
     parser.add_argument("--spread",         type=int,   default=50,   help="Spread threshold USD")
-    parser.add_argument("--bankroll",       type=float, default=10.0, help="Starting bankroll USD")
+    parser.add_argument("--bankroll",       type=float, default=0.0,  help="Starting bankroll USD (0 = auto-fetch from Polymarket)")
     parser.add_argument("--daily-stop",     type=float, default=5.0,  help="Daily stop loss USD")
     parser.add_argument("--max-trades",     type=int,   default=20,   help="Max trades per day")
     args = parser.parse_args()
