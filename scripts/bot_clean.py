@@ -85,7 +85,6 @@ def fetch_polymarket_balance(private_key: str, clob_creds: Optional[Dict] = None
     except Exception as e:
         print(f"[WARN] Polymarket balance: {e}")
         return None
-        return None
 
 def fetch_usdc_balance(wallet_address: str) -> float:
     USDC_CONTRACT = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
@@ -618,18 +617,27 @@ def place_live_order(
 
         if resp.get("success") or status == "matched":
             # Market order filled — get actual fill details
+            # FIX 1: Jangan fallback ke estimated price untuk hitung shares.
+            # Coba semua field response dulu sebelum fallback ke size_usdc/best_ask.
             filled = check_order_fill(client, order_id)
-            # Calculate actual shares from response if check_order_fill fails
             if not filled or filled <= 0:
                 maker_amount = float(resp.get("maker_amount", 0) or resp.get("taker_amount", 0) or 0)
-                filled = maker_amount if maker_amount > 0 else (size_usdc / price if price > 0 else 5.0)
-            
-            # Try to get actual avg fill price
-            actual_price = price  # fallback
-            if filled > 0:
-                actual_price = size_usdc / filled  # USD / shares = avg price per share
-            
-            print(f"✅ MARKET FILLED! {filled:.1f} shares ~${actual_price:.2f}/share | Cost: ${size_usdc:.2f}")
+                if maker_amount > 0:
+                    filled = maker_amount
+                # Jangan pakai size_usdc/price — price adalah estimasi, bukan fill nyata.
+                # Biarkan filled = None, actual_price akan di-set dari best_ask.
+
+            # Hitung actual avg fill price dari biaya & shares nyata.
+            # Kalau filled tidak tersedia, gunakan best_ask dari orderbook sebagai proxy.
+            if filled and filled > 0:
+                actual_price = size_usdc / filled
+            else:
+                # Fallback terbaik: best_ask yang sudah dicek sebelum order
+                actual_price = price  # price = real Polymarket price dari _execute_trade, bukan estimasi spread
+                filled = size_usdc / actual_price if actual_price > 0 else 0
+                print(f"[WARN] Fill amount unknown — estimating {filled:.2f} shares dari best_ask ${actual_price:.2f}")
+
+            print(f"✅ MARKET FILLED! {filled:.2f} shares ~${actual_price:.3f}/share | Cost: ${size_usdc:.2f}")
             return {
                 "success": True,
                 "order_id": order_id, "status": "matched",
@@ -1628,7 +1636,13 @@ class AutoTrader:
         total_cost = cost + fee
 
         if won:
-            payout = window.size * 1.0
+            # FIX 2: Hitung payout dari actual cost & actual price, bukan dari window.size
+            # yang bisa salah kalau fill amount tidak tersedia saat order.
+            if window._is_live and window._actual_price > 0 and window._actual_cost > 0:
+                real_shares = window._actual_cost / window._actual_price
+            else:
+                real_shares = window.size
+            payout = real_shares * 1.0
             profit = payout - total_cost
             window.profit = profit  # ← UPDATE LOG
             self.daily_stats.wins   += 1
@@ -1766,7 +1780,10 @@ class AutoTrader:
                         if result is not None:
                             pw.final_spread = btc_price - pw.ptb
                             self._finalize_window_result(pw, result)
-                            self.all_time_trades.append(pw)
+                            # FIX 3: Cek duplikat sebelum append — window PENDING sudah
+                            # di-append saat pertama kali diproses di main loop.
+                            if pw not in self.all_time_trades:
+                                self.all_time_trades.append(pw)
                             resolved_now.append(pw)
                             print(f"[PENDING] Resolved deferred window {pw.start.strftime('%H:%M')}: {'WIN ✅' if result else 'LOSS ❌'}")
                         # Force resolve if >30min pending (stale)
@@ -1777,7 +1794,8 @@ class AutoTrader:
                                 (pw.direction == Direction.UP and pw.final_spread > 0)
                             )
                             self._finalize_window_result(pw, fallback_result)
-                            self.all_time_trades.append(pw)
+                            if pw not in self.all_time_trades:
+                                self.all_time_trades.append(pw)
                             resolved_now.append(pw)
                             print(f"[PENDING] Stale trade {pw.start.strftime('%H:%M')} — force resolved (Chainlink): {'WIN ✅' if fallback_result else 'LOSS ❌'}")
                     for pw in resolved_now:
