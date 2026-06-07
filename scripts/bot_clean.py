@@ -37,12 +37,13 @@ if os.path.exists(_ENV_FILE):
 # ---------------------------------------------------------------------------
 
 CHECK_INTERVAL       = 5          # seconds between price fetches
-SPREAD_THRESHOLD     = 50         # USD minimum spread to consider a trade
-ALERT_WINDOW_START   = 3 * 60 + 30  # 210s — start of LOCK zone (lebih awal, beri waktu manual order)
+SPREAD_THRESHOLD     = 100        # USD minimum spread — dinaikkan dari 50 ke 100 untuk sinyal lebih kuat
+ALERT_WINDOW_START   = 3 * 60 + 30  # 210s — start of LOCK zone
 ALERT_WINDOW_END     = 4 * 60 + 20  # 260s — end of LOCK zone (stop 40s sebelum close)
 FEE_RATE             = 0.02       # Polymarket taker fee
 MIN_ORDER_USDC       = 1.0        # Polymarket minimum order $1
 BUY_PRICE_BUFFER     = 0.10       # Add to price to cross spread & ensure fill (min $0.10)
+MAX_ENTRY_PRICE      = 0.72       # Harga real Polymarket max untuk entry — turun dari 0.80 ke 0.72
 
 def fetch_polymarket_balance(private_key: str, clob_creds: Optional[Dict] = None) -> Optional[float]:
     """Fetch real Polymarket pUSD balance via CLOB SDK (POLY_1271)."""
@@ -1157,7 +1158,7 @@ class AutoTrader:
                 f"Today Trades: <code>{self.daily_stats.trades}</code>\n"
                 f"W/L: <code>{self.daily_stats.wins}/{self.daily_stats.losses}</code> ({wr:.0f}%)\n"
                 f"P/L: <code>${self.daily_stats.profit:+.2f}</code>\n"
-                f"Filter: spread≥<code>{self.spread_threshold}</code>, price <code>0.40-0.80</code>"
+                f"Filter: spread≥<code>{self.spread_threshold}</code>, price <code>0.40-{MAX_ENTRY_PRICE:.2f}</code>"
             )
         
         elif cmd == "pnl":
@@ -1403,40 +1404,51 @@ class AutoTrader:
         if self.mode == Mode.LIVE or self.signal_only:
             spread = abs_spread or abs(window.final_spread or 0)
 
-            # Fetch harga REAL dari Polymarket sebelum kirim sinyal
+            # Fetch harga REAL dari Polymarket sebelum eksekusi order
             up_price, down_price = fetch_polymarket_real_prices(window.start)
             real_price = up_price if direction == Direction.UP else down_price
             print(f"[PRICE CHECK] UP={up_price:.2f} DOWN={down_price:.2f} | Signal={direction.value}")
 
-            # Validasi: harga real harus match direction
-            # Kalau signal UP tapi UP sudah >0.85 = market terlalu mahal, skip
-            # Kalau signal DOWN tapi DOWN sudah <0.30 = market pricing DOWN unlikely, skip
-            MIN_PRICE = 0.40   # harga terlalu murah = market tidak percaya direction ini (was 0.30)
-            MAX_PRICE = 0.80   # di atas ini profit terlalu tipis (was 0.85)
-            if real_price > 0:
-                if real_price < MIN_PRICE:
-                    msg_skip = (
-                        f"⚠️ <b>SIGNAL SKIPPED</b>\n"
-                        f"Direction {direction.value} tapi harga real hanya <code>{real_price:.2f}</code> ({int(real_price*100)}¢)\n"
-                        f"Market tidak confident → skip untuk hindari loss"
-                    )
-                    print(f"[SKIP] {direction.value} price too low: {real_price:.2f}")
-                    if self.telegram_token and self.chat_id:
-                        send_telegram(msg_skip, self.telegram_token, self.chat_id)
-                    return False
-                if real_price > MAX_PRICE:
-                    if self.telegram_token and self.chat_id:
-                        send_telegram(
-                            f"⚠️ <b>SIGNAL SKIPPED</b>\n"
-                            f"Direction: <b>{direction.value}</b> | Price: <code>{real_price:.2f}</code>\n"
-                            f"Reason: <i>Price too high — no profit margin (>{MAX_PRICE})</i>",
-                            self.telegram_token, self.chat_id
-                        )
-                    print(f"[SKIP] {direction.value} price too high (no profit): {real_price:.2f}")
-                    return False
+            MIN_PRICE = 0.40  # terlalu murah = market tidak yakin direction ini
 
-            # Pakai harga real jika tersedia, fallback ke estimasi
-            actual_price = real_price if real_price > 0 else entry_price
+            # Kalau harga real tidak bisa di-fetch (0.0), BLOK eksekusi.
+            # Tanpa verifikasi harga, bot bisa fill di 93-99¢ tanpa sadar.
+            if real_price <= 0:
+                msg_noprice = (
+                    f"⚠️ <b>SIGNAL SKIPPED</b>\n"
+                    f"Direction: <b>{direction.value}</b>\n"
+                    f"Reason: <i>Harga real Polymarket tidak tersedia — skip untuk hindari fill mahal</i>"
+                )
+                print(f"[SKIP] Cannot verify real price — aborting to avoid expensive fill")
+                if self.telegram_token and self.chat_id:
+                    send_telegram(msg_noprice, self.telegram_token, self.chat_id)
+                return False
+
+            if real_price < MIN_PRICE:
+                msg_skip = (
+                    f"⚠️ <b>SIGNAL SKIPPED</b>\n"
+                    f"Direction {direction.value} tapi harga real hanya <code>{real_price:.2f}</code> ({int(real_price*100)}¢)\n"
+                    f"Market tidak confident → skip"
+                )
+                print(f"[SKIP] {direction.value} price too low: {real_price:.2f}")
+                if self.telegram_token and self.chat_id:
+                    send_telegram(msg_skip, self.telegram_token, self.chat_id)
+                return False
+
+            if real_price > MAX_ENTRY_PRICE:
+                if self.telegram_token and self.chat_id:
+                    send_telegram(
+                        f"⚠️ <b>SIGNAL SKIPPED</b>\n"
+                        f"Direction: <b>{direction.value}</b> | Price: <code>{real_price:.2f}</code> ({int(real_price*100)}¢)\n"
+                        f"Reason: <i>Price >{int(MAX_ENTRY_PRICE*100)}¢ — profit margin terlalu tipis</i>\n"
+                        f"Risk/reward: win <code>+${(1-real_price):.2f}</code> vs loss <code>-${real_price:.2f}</code>",
+                        self.telegram_token, self.chat_id
+                    )
+                print(f"[SKIP] {direction.value} price too high: {real_price:.2f} > MAX {MAX_ENTRY_PRICE:.2f}")
+                return False
+
+            # Pakai harga real yang sudah diverifikasi
+            actual_price = real_price
             bet_usdc     = max(cost, MIN_ORDER_USDC)
             profit_est   = round(bet_usdc / actual_price * (1 - FEE_RATE) - bet_usdc, 2)
             win_prob     = estimate_win_probability(abs(spread))
