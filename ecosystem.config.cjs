@@ -3,8 +3,8 @@ module.exports = {
     {
       name:        "polylock-bot",
       script:      "python3",
-      args:        "-u /mnt/d/polylock-git/scripts/bot_clean.py --live",
-      cwd:         "/mnt/d/polylock-git/scripts",
+      args:        "-u /root/.openclaw/workspace/polymarket/scripts/bot_clean.py --live",
+      cwd:         "/root/.openclaw/workspace/polymarket/scripts",
       interpreter: "none",
       autorestart: true,
       watch:       false,
