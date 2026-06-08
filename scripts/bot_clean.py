@@ -275,31 +275,43 @@ def load_or_create_clob_creds(private_key: str) -> Optional[Dict]:
         return None
 
 
-def fetch_polymarket_real_prices(window_start: datetime) -> Tuple[float, float]:
+def fetch_polymarket_real_prices(window_start: datetime, retries: int = 3, delay: float = 2.0) -> Tuple[float, float]:
     """
     Fetch harga real UP/DOWN dari Polymarket gamma API untuk window saat ini.
+    Retry sampai 3x dengan delay 2s — penting karena ini gate utama sebelum order.
     Returns (up_price, down_price) dalam range 0.0-1.0
-    Returns (0.0, 0.0) jika gagal.
+    Returns (0.0, 0.0) jika semua retry gagal.
     """
-    try:
-        ts   = int(window_start.timestamp())
-        slug = f"btc-updown-5m-{ts}"
-        url  = f"{GAMMA_HOST}/markets?slug={slug}"
-        import httpx
-        resp = httpx.get(url, timeout=8, verify=False)
-        resp.raise_for_status()
-        markets = resp.json()
-        if not markets:
-            return 0.0, 0.0
-        m      = markets[0]
-        prices = json.loads(m.get("outcomePrices", "[0,0]")) if isinstance(m.get("outcomePrices"), str) else m.get("outcomePrices", [0, 0])
-        outcomes = json.loads(m.get("outcomes", '["Up","Down"]')) if isinstance(m.get("outcomes"), str) else m.get("outcomes", ["Up", "Down"])
-        up_idx   = next((i for i, o in enumerate(outcomes) if "up" in str(o).lower()), 0)
-        down_idx = next((i for i, o in enumerate(outcomes) if "down" in str(o).lower()), 1)
-        return float(prices[up_idx]), float(prices[down_idx])
-    except Exception as e:
-        print(f"[WARN] fetch real prices: {e}")
-        return 0.0, 0.0
+    ts   = int(window_start.timestamp())
+    slug = f"btc-updown-5m-{ts}"
+    url  = f"{GAMMA_HOST}/markets?slug={slug}"
+
+    for attempt in range(1, retries + 1):
+        try:
+            import httpx
+            resp = httpx.get(url, timeout=8, verify=False)
+            resp.raise_for_status()
+            markets = resp.json()
+            if not markets:
+                print(f"[PRICE] Attempt {attempt}/{retries} — market not found for slug {slug}")
+                if attempt < retries:
+                    time.sleep(delay)
+                continue
+            m        = markets[0]
+            prices   = json.loads(m.get("outcomePrices", "[0,0]")) if isinstance(m.get("outcomePrices"), str) else m.get("outcomePrices", [0, 0])
+            outcomes = json.loads(m.get("outcomes", '["Up","Down"]')) if isinstance(m.get("outcomes"), str) else m.get("outcomes", ["Up", "Down"])
+            up_idx   = next((i for i, o in enumerate(outcomes) if "up" in str(o).lower()), 0)
+            down_idx = next((i for i, o in enumerate(outcomes) if "down" in str(o).lower()), 1)
+            up_p, down_p = float(prices[up_idx]), float(prices[down_idx])
+            if up_p > 0 or down_p > 0:
+                return up_p, down_p
+        except Exception as e:
+            print(f"[WARN] fetch real prices attempt {attempt}/{retries}: {e}")
+        if attempt < retries:
+            time.sleep(delay)
+
+    print(f"[WARN] fetch real prices — semua {retries} attempt gagal")
+    return 0.0, 0.0
 
 
 def fetch_btc_5m_market_tokens(window_start: Optional[datetime] = None) -> Tuple[Optional[str], Optional[str]]:
@@ -1409,50 +1421,45 @@ class AutoTrader:
         if self.mode == Mode.LIVE or self.signal_only:
             spread = abs_spread or abs(window.final_spread or 0)
 
-            # Fetch harga REAL dari Polymarket sebelum eksekusi order
+            # ── STEP 1: Fetch & validasi harga real DULU sebelum kirim sinyal apapun ──
+            # Semua guard di sini. Kalau lolos semua baru kirim notif.
             up_price, down_price = fetch_polymarket_real_prices(window.start)
             real_price = up_price if direction == Direction.UP else down_price
             print(f"[PRICE CHECK] UP={up_price:.2f} DOWN={down_price:.2f} | Signal={direction.value}")
 
             MIN_PRICE = 0.40  # terlalu murah = market tidak yakin direction ini
 
-            # Kalau harga real tidak bisa di-fetch (0.0), BLOK eksekusi.
-            # Tanpa verifikasi harga, bot bisa fill di 93-99¢ tanpa sadar.
+            # Guard 1: harga real harus bisa di-fetch — kalau gagal, jangan order
+            # (sebelumnya guard ini ada tapi SETELAH signal dikirim → sinyal palsu)
             if real_price <= 0:
-                msg_noprice = (
-                    f"⚠️ <b>SIGNAL SKIPPED</b>\n"
-                    f"Direction: <b>{direction.value}</b>\n"
-                    f"Reason: <i>Harga real Polymarket tidak tersedia — skip untuk hindari fill mahal</i>"
-                )
                 print(f"[SKIP] Cannot verify real price — aborting to avoid expensive fill")
-                if self.telegram_token and self.chat_id:
-                    send_telegram(msg_noprice, self.telegram_token, self.chat_id)
-                return False
-
-            if real_price < MIN_PRICE:
-                msg_skip = (
-                    f"⚠️ <b>SIGNAL SKIPPED</b>\n"
-                    f"Direction {direction.value} tapi harga real hanya <code>{real_price:.2f}</code> ({int(real_price*100)}¢)\n"
-                    f"Market tidak confident → skip"
+                self._notify(
+                    f"⏸️ <b>SKIP</b> — {direction.value} @ {window.start.strftime('%H:%M')}\n"
+                    f"<i>Harga Polymarket tidak bisa di-fetch, skip window ini</i>"
                 )
+                return False
+
+            # Guard 2: harga terlalu murah
+            if real_price < MIN_PRICE:
                 print(f"[SKIP] {direction.value} price too low: {real_price:.2f}")
-                if self.telegram_token and self.chat_id:
-                    send_telegram(msg_skip, self.telegram_token, self.chat_id)
+                self._notify(
+                    f"⏸️ <b>SKIP</b> — {direction.value} {real_price:.2f} ({int(real_price*100)}¢)\n"
+                    f"<i>Market tidak confident direction ini</i>"
+                )
                 return False
 
+            # Guard 3: harga terlalu mahal — profit tipis, risk/reward jelek
             if real_price > MAX_ENTRY_PRICE:
-                if self.telegram_token and self.chat_id:
-                    send_telegram(
-                        f"⚠️ <b>SIGNAL SKIPPED</b>\n"
-                        f"Direction: <b>{direction.value}</b> | Price: <code>{real_price:.2f}</code> ({int(real_price*100)}¢)\n"
-                        f"Reason: <i>Price >{int(MAX_ENTRY_PRICE*100)}¢ — profit margin terlalu tipis</i>\n"
-                        f"Risk/reward: win <code>+${(1-real_price):.2f}</code> vs loss <code>-${real_price:.2f}</code>",
-                        self.telegram_token, self.chat_id
-                    )
+                rr_win  = round(1 - real_price, 2)
+                rr_loss = real_price
                 print(f"[SKIP] {direction.value} price too high: {real_price:.2f} > MAX {MAX_ENTRY_PRICE:.2f}")
+                self._notify(
+                    f"⏸️ <b>SKIP</b> — {direction.value} {real_price:.2f} ({int(real_price*100)}¢)\n"
+                    f"<i>>{int(MAX_ENTRY_PRICE*100)}¢ — win +${rr_win} vs loss -${rr_loss} (ratio 1:{round(rr_loss/rr_win,1)})</i>"
+                )
                 return False
 
-            # Pakai harga real yang sudah diverifikasi
+            # ── STEP 2: Semua guard lolos — baru kirim signal ──
             actual_price = real_price
             bet_usdc     = max(cost, MIN_ORDER_USDC)
             profit_est   = round(bet_usdc / actual_price * (1 - FEE_RATE) - bet_usdc, 2)
@@ -1465,17 +1472,20 @@ class AutoTrader:
             slug         = f"btc-updown-5m-{ts}"
             market_url   = f"https://polymarket.com/event/{slug}"
 
-            # Warning kalau harga agak rendah (30-45¢)
-            price_warn = " ⚠️ harga rendah, pertimbangkan skip" if real_price < 0.45 else ""
+            # Semua guard sudah lolos di atas — real_price dijamin 0.40–0.72 di sini
+            rr_win  = round(1 - actual_price, 2)
+            rr_loss = round(actual_price, 2)
+            rr_ratio = round(rr_loss / rr_win, 1)
 
             msg = (
                 f"{emoji} <b>LOCK SIGNAL — BTC 5m</b>\n"
                 f"Action    : <b>{action}</b>\n"
                 f"─────────────────\n"
-                f"Harga Real : <code>{actual_price:.2f}</code> ({int(actual_price*100)}¢){price_warn}\n"
+                f"Harga Real : <code>{actual_price:.2f}</code> ({int(actual_price*100)}¢)\n"
                 f"Bet        : <code>${bet_usdc:.2f} USDC</code>\n"
                 f"Est. Profit: <code>+${profit_est:.2f}</code> jika menang\n"
                 f"Win Prob   : <code>{int(win_prob*100)}%</code>\n"
+                f"Risk/Reward: win <code>+${rr_win}</code> vs loss <code>-${rr_loss}</code> (1:{rr_ratio})\n"
                 f"Spread     : <code>${spread:.0f}</code>\n"
                 f"Window     : <code>{format_time(window.start)}</code>\n"
                 f"─────────────────\n"
