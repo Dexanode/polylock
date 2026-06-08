@@ -563,12 +563,14 @@ def place_live_order(
     price: float,
     funder: str = None,
 ) -> Dict:
-    """Place MARKET order via CLOB V2 (immediate fill at best price).
+    """Place limit order (GTC) at best ask price via CLOB V2.
+    Sebelumnya pakai market order (FOK) yang sering reject kalau likuiditas tipis.
+    Sekarang pakai GTC limit order di best_ask + small buffer — fill lebih reliable.
     Returns {"success": True, ...} or {"success": False, "error": "reason"}"""
     try:
         _patch_httpx_proxy()
-        from py_clob_client_v2 import ClobClient, ApiCreds, SignatureTypeV2
-        from py_clob_client_v2.clob_types import MarketOrderArgsV2
+        from py_clob_client_v2 import ClobClient, ApiCreds, SignatureTypeV2, OrderType
+        from py_clob_client_v2.clob_types import OrderArgs
         from py_clob_client_v2.constants import POLYGON
         from web3 import Web3
 
@@ -589,72 +591,75 @@ def place_live_order(
             funder=funder,
         )
 
-        print(f"[MARKET ORDER] ${size_usdc:.2f} USDC → {token_id[:15]}...")
-        
-        # Pre-check: skip if not enough liquidity to fill size_usdc
+        # Cek likuiditas dan ambil best_ask dari orderbook
         has_liq, best_ask = check_liquidity(client, token_id, min_size_usdc=size_usdc)
         if not has_liq:
             return {"success": False, "error": f"Thin orderbook — not enough asks for ${size_usdc:.2f} (best ask: {best_ask:.2f})"}
-        
-        # Log best ask drift for info only — don't block (market orders fill at best available price)
-        if best_ask > 0 and abs(best_ask - price) > 0.15:
-            print(f"[INFO] Best ask {best_ask:.2f} vs signal {price:.2f} (drift {abs(best_ask-price):.2f}) — market order will fill at best price, proceeding")
-        
-        order_args = MarketOrderArgsV2(
+
+        # Harga order: pakai best_ask dari orderbook (harga real), bukan estimasi spread.
+        # Tambah buffer kecil (0.01) supaya order kita jadi taker dan langsung terisi.
+        # Kalau best_ask tidak ada, fallback ke price yang sudah diverifikasi dari Polymarket API.
+        fill_price = round(min((best_ask or price) + 0.01, 0.99), 2)
+
+        # Kalau fill_price sudah melebihi MAX_ENTRY_PRICE, abort — jangan order.
+        if fill_price > MAX_ENTRY_PRICE + 0.03:  # toleransi 3 tick dari max
+            return {"success": False, "error": f"Best ask {fill_price:.2f} melebihi MAX_ENTRY_PRICE {MAX_ENTRY_PRICE:.2f} — skip"}
+
+        # Hitung shares dari USD amount dan fill price
+        shares = round(size_usdc / fill_price, 2)
+        if shares < 1.0:
+            shares = 1.0  # minimum 1 share
+
+        print(f"[LIMIT ORDER] {shares:.2f} shares @ ${fill_price:.3f} (best_ask={best_ask:.3f}) | Total: ${shares*fill_price:.2f} USDC")
+
+        order_args = OrderArgs(
             token_id=token_id,
-            amount=size_usdc,  # USD amount to spend
+            price=fill_price,
+            size=shares,
             side="BUY",
             builder_code=BUILDER_CODE,
         )
-        
-        resp = client.create_and_post_market_order(order_args)
+
+        resp = client.create_and_post_order(order_args, order_type=OrderType.GTC)
 
         if not resp:
             return {"success": False, "error": "CLOB API empty response — network issue?"}
 
         order_id = resp.get("orderID") or resp.get("id", "?")
         status = resp.get("status", "?")
-        print(f"[MARKET] ID: {order_id} | Status: {status}")
+        print(f"[LIMIT ORDER] ID: {order_id[:20]}... | Status: {status}")
 
-        if resp.get("success") or status == "matched":
-            # Market order filled — get actual fill details
-            # FIX 1: Jangan fallback ke estimated price untuk hitung shares.
-            # Coba semua field response dulu sebelum fallback ke size_usdc/best_ask.
-            filled = check_order_fill(client, order_id)
-            if not filled or filled <= 0:
-                maker_amount = float(resp.get("maker_amount", 0) or resp.get("taker_amount", 0) or 0)
-                if maker_amount > 0:
-                    filled = maker_amount
-                # Jangan pakai size_usdc/price — price adalah estimasi, bukan fill nyata.
-                # Biarkan filled = None, actual_price akan di-set dari best_ask.
+        # GTC limit order: status bisa "live" (belum fill) atau "matched" (langsung fill)
+        # Karena kita order di best_ask+buffer, seharusnya langsung matched sebagai taker.
+        if resp.get("success") or status in ("matched", "live", "OPEN"):
+            # Pakai shares dan fill_price yang sudah kita hitung sebelum order
+            # (lebih akurat daripada parsing response yang formatnya bisa beda-beda)
+            actual_cost = round(shares * fill_price, 4)
+            print(f"✅ LIMIT ORDER PLACED! {shares:.2f} shares @ ${fill_price:.3f} | Cost: ${actual_cost:.2f}")
 
-            # Hitung actual avg fill price dari biaya & shares nyata.
-            # Kalau filled tidak tersedia, gunakan best_ask dari orderbook sebagai proxy.
-            if filled and filled > 0:
-                actual_price = size_usdc / filled
-            else:
-                # Fallback terbaik: best_ask yang sudah dicek sebelum order
-                actual_price = price  # price = real Polymarket price dari _execute_trade, bukan estimasi spread
-                filled = size_usdc / actual_price if actual_price > 0 else 0
-                print(f"[WARN] Fill amount unknown — estimating {filled:.2f} shares dari best_ask ${actual_price:.2f}")
+            if status == "live":
+                # Order masuk tapi belum fill — ini GTC, akan fill saat ada seller
+                print(f"[INFO] Order live/pending — akan fill saat ada seller di {fill_price:.3f}")
 
-            print(f"✅ MARKET FILLED! {filled:.2f} shares ~${actual_price:.3f}/share | Cost: ${size_usdc:.2f}")
             return {
                 "success": True,
-                "order_id": order_id, "status": "matched",
-                "shares": filled, "price": actual_price,
-                "cost": size_usdc, "token_id": token_id,
+                "order_id": order_id,
+                "status": status,
+                "shares": shares,
+                "price": fill_price,
+                "cost": actual_cost,
+                "token_id": token_id,
             }
 
         else:
-            err_msg = resp.get("errorMsg", str(resp))
-            print(f"[MARKET ERROR] {err_msg}")
-            return {"success": False, "error": f"Market order rejected: {err_msg[:150]}"}
+            err_msg = resp.get("errorMsg", resp.get("error", str(resp)))
+            print(f"[ORDER ERROR] {err_msg}")
+            return {"success": False, "error": f"Order rejected: {err_msg[:150]}"}
 
     except Exception as e:
         err = str(e)
         if "couldn't be fully filled" in err or "FOK" in err or "no match" in err.lower():
-            return {"success": False, "error": f"Zero liquidity — no sell orders at any price near {price:.2f}"}
+            return {"success": False, "error": "FOK rejected — orderbook terlalu tipis, skip window ini"}
         elif "not enough" in err.lower() or "insufficient" in err.lower():
             return {"success": False, "error": "Insufficient pUSD in deposit wallet"}
         elif "timeout" in err.lower() or "timed out" in err.lower():
